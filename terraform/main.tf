@@ -221,6 +221,66 @@ module "vpc" {
   tags = local.tags
 }
 
+# Pre-destroy cleanup of runtime-created, un-managed resources.
+# The AWS Load Balancer Controller and VPC-CNI create ALBs and k8s-*
+# security groups at runtime that Terraform never tracks; they block VPC
+# teardown (orphaned ALB ENIs pin subnets/IGW; k8s SGs pin the VPC), which
+# is what forced multiple manual destroy passes historically.
+#
+# Because destroy runs in reverse-dependency order, this resource is
+# destroyed BEFORE module.vpc / module.eks — so its destroy-time
+# provisioner runs while the cluster + VPC still exist, which is exactly
+# when the cleanup can find and delete those resources.
+#
+# Greenfield only: never touch an operator's cluster in brownfield mode.
+resource "null_resource" "lb_cleanup" {
+  count = var.manage_cluster ? 1 : 0
+
+  # triggers are the only values available to a destroy provisioner
+  # (it can't reference vars/locals), so stash what the script needs.
+  triggers = {
+    region  = var.region
+    cluster = local.cluster_name
+    script  = "${path.module}/scripts/cleanup-orphaned-lbs.sh"
+  }
+
+  provisioner "local-exec" {
+    when       = destroy
+    command    = "${self.triggers.script} ${self.triggers.region} ${self.triggers.cluster}"
+    on_failure = continue # best-effort; never block destroy on cleanup
+  }
+
+  depends_on = [module.vpc, module.eks]
+}
+
+# Pre-destroy cleanup of Karpenter custom resources. Karpenter's CRs
+# (NodePools / EC2NodeClasses / NodeClaims) hold controller-managed
+# finalizers; on teardown the karpenter-crd Helm uninstall hangs
+# (`context deadline exceeded`) because the controller is torn down
+# alongside the CRD chart and never clears them — this has forced a
+# second `terraform destroy` on every teardown so far. This resource
+# depends_on module.karpenter + module.eks, so on destroy (reverse order)
+# it runs FIRST — while the cluster + CRDs still exist — deleting the CRs
+# and stripping finalizers so the CRD chart uninstalls in one pass.
+# Greenfield only; on_failure=continue so it can never block a destroy.
+resource "null_resource" "karpenter_cr_cleanup" {
+  count = var.manage_cluster ? 1 : 0
+
+  triggers = {
+    region  = var.region
+    cluster = local.cluster_name
+    script  = "${path.module}/scripts/cleanup-karpenter-crs.sh"
+  }
+
+  provisioner "local-exec" {
+    when       = destroy
+    command    = "${self.triggers.script} ${self.triggers.region} ${self.triggers.cluster}"
+    on_failure = continue
+  }
+
+  depends_on = [module.karpenter, module.eks]
+}
+
 # ---------- EKS ----------
 # PRD-53: skipped in brownfield mode. Cluster attributes come from
 # the data sources computed in local.cluster_* instead.
@@ -239,7 +299,31 @@ module "eks" {
   # leave this at its default (true).
   enable_cluster_creator_admin_permissions = var.enable_cluster_creator_admin_permissions
 
+  # Operator-supplied cluster-admin principals (e.g. the apply principal),
+  # granted via EKS access entries. See var.cluster_admin_principal_arns.
+  cluster_admin_principal_arns = var.cluster_admin_principal_arns
+
   tags = local.tags
+}
+
+# ---------- Multi-node cluster placement groups (PRD-55) ----------
+# One EC2 "cluster" placement group PER AZ the VPC spans. A cluster PG
+# co-locates instances in a single AZ on the same high-bisection-bandwidth
+# segment — the AWS-recommended topology for tightly-coupled EFA/NCCL
+# traffic. Per-AZ (not one) gives flexibility in which zone the static
+# multi-node pool lands, and headroom for future per-zone capacity
+# fallback. Greenfield only (needs the VPC's AZ list); brownfield operators
+# supply their own capacity story.
+locals {
+  multinode_azs = var.manage_cluster && var.enable_multinode ? module.vpc[0].azs : []
+}
+
+resource "aws_placement_group" "multinode" {
+  for_each = toset(local.multinode_azs)
+
+  name     = "${var.project_name}-multinode-${each.value}"
+  strategy = "cluster"
+  tags     = merge(local.tags, { "accelbench.io/az" = each.value })
 }
 
 # ---------- Karpenter ----------
@@ -251,14 +335,26 @@ module "eks" {
 module "karpenter" {
   source = "./modules/karpenter"
 
-  cluster_name      = local.cluster_name
-  cluster_endpoint  = local.cluster_endpoint
-  karpenter_version = var.karpenter_version
+  cluster_name       = local.cluster_name
+  cluster_endpoint   = local.cluster_endpoint
+  kubernetes_version = var.cluster_version
+  karpenter_version  = var.karpenter_version
 
   install_controller           = var.install_karpenter_controller
   install_nvidia_device_plugin = var.install_nvidia_device_plugin
   manage_pull_through_cache    = var.manage_pull_through_cache
   cluster_oidc_issuer_url      = local.oidc_issuer_url
+
+  # PRD-55: multi-node/distributed-inference pool. One static EFA GPU
+  # NodePool per AZ, each bound to that AZ's cluster placement group.
+  enable_multinode    = var.enable_multinode
+  install_dra_drivers = var.enable_multinode
+  # map AZ -> placement group name, consumed by the per-AZ NodeClasses.
+  multinode_placement_groups = { for az, pg in aws_placement_group.multinode : az => pg.name }
+  # map AZ -> private subnet ID: NodeClasses select their subnet by id
+  # (subnetSelectorTerms has no AZ field, and the subnets aren't tagged by
+  # zone), which also pins each pool to its AZ.
+  multinode_subnets = var.manage_cluster && var.enable_multinode ? module.vpc[0].private_subnets_by_az : {}
 
   tags = local.tags
 }
@@ -273,6 +369,10 @@ module "aurora" {
   eks_node_security_group_id = local.node_security_group_id
   min_capacity               = var.aurora_min_capacity
   max_capacity               = var.aurora_max_capacity
+
+  # Rotation OFF by default. See variable note: RDS auto-enables 7-day rotation,
+  # which breaks the K8s secret; disable via a one-time true->false apply.
+  manage_master_user_password_rotation = var.manage_master_user_password_rotation
 
   tags = local.tags
 }
@@ -326,6 +426,15 @@ resource "kubernetes_namespace" "accelbench" {
       metadata[0].labels,
       metadata[0].annotations,
     ]
+  }
+
+  # Cap the delete wait. On teardown the K8s API is going away with the
+  # cluster, and a lingering finalizer on the namespace makes the delete
+  # hang indefinitely (it hit the destroy context deadline historically).
+  # A short timeout turns that infinite hang into a fast, clear failure
+  # that a re-run (or `state rm`) resolves quickly.
+  timeouts {
+    delete = "3m"
   }
 
   depends_on = [module.eks]
@@ -553,8 +662,10 @@ resource "aws_eks_pod_identity_association" "loadgen" {
 
 # ---------- S3 Bucket for Model Weights ----------
 resource "aws_s3_bucket" "models" {
-  bucket        = "${var.project_name}-models-${data.aws_caller_identity.current.account_id}"
-  force_destroy = false
+  bucket = "${var.project_name}-models-${data.aws_caller_identity.current.account_id}"
+  # Default false protects cached model weights from an accidental
+  # destroy; flip force_destroy_buckets=true for an intentional teardown.
+  force_destroy = var.force_destroy_buckets
   tags          = local.tags
 }
 
@@ -780,4 +891,38 @@ resource "aws_ecr_pull_through_cache_rule" "dockerhub" {
   ecr_repository_prefix = "dockerhub"
   upstream_registry_url = "registry-1.docker.io"
   credential_arn        = aws_secretsmanager_secret.dockerhub_credential[0].arn
+}
+
+# PRD-66 Part 2a: GHCR pull-through for the co-located PP image
+# (ghcr.io/llm-d/llm-d-aws, 8.9 GB). Mirrors docker.io into ECR on first pull.
+# GHCR IS a supported ECR pull-through upstream (upstream URL "ghcr.io", verified
+# against the CreatePullThroughCacheRule API ref), but — unlike the no-auth
+# ecr-public/quay/k8s upstreams — it REQUIRES an auth secret even though
+# llm-d-aws is a PUBLIC image: a GitHub username + a PAT with read:packages.
+# Secret name must use the ecr-pullthroughcache/ prefix (AWS requirement).
+#
+# No node-IAM or SM-read policy change needed: karpenter_node_ecr_pullthrough
+# uses Resource="*" for CreateRepository + BatchImportUpstreamImage, and the SM
+# read policy is scoped to ecr-pullthroughcache/* — both already cover ghcr.
+resource "aws_secretsmanager_secret" "ghcr_credential" {
+  count       = var.manage_pull_through_cache ? 1 : 0
+  name        = "ecr-pullthroughcache/ghcr"
+  description = "GitHub Container Registry credentials consumed by the ECR pull-through cache"
+  tags        = local.tags
+}
+
+resource "aws_secretsmanager_secret_version" "ghcr_credential" {
+  count     = var.manage_pull_through_cache ? 1 : 0
+  secret_id = aws_secretsmanager_secret.ghcr_credential[0].id
+  secret_string = jsonencode({
+    username    = var.github_username
+    accessToken = var.github_token
+  })
+}
+
+resource "aws_ecr_pull_through_cache_rule" "ghcr" {
+  count                 = var.manage_pull_through_cache ? 1 : 0
+  ecr_repository_prefix = "ghcr"
+  upstream_registry_url = "ghcr.io"
+  credential_arn        = aws_secretsmanager_secret.ghcr_credential[0].arn
 }

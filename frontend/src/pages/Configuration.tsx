@@ -5,6 +5,8 @@ import {
   deleteHFToken,
   putDockerHubToken,
   deleteDockerHubToken,
+  putGHCRToken,
+  deleteGHCRToken,
   getCatalogMatrix,
   putCatalogMatrix,
   listScenarioOverrides,
@@ -112,6 +114,7 @@ function formatDate(iso?: string): string {
 type RotateModal =
   | { kind: "hf" }
   | { kind: "dockerhub" }
+  | { kind: "ghcr" }
   | null;
 
 function RotateModalComponent({
@@ -147,6 +150,8 @@ function RotateModalComponent({
       if (!modal) return;
       if (modal.kind === "hf") {
         await putHFToken(token);
+      } else if (modal.kind === "ghcr") {
+        await putGHCRToken(username, token);
       } else {
         await putDockerHubToken(username, token);
       }
@@ -159,7 +164,13 @@ function RotateModalComponent({
     }
   }
 
-  const title = modal.kind === "hf" ? "Rotate HuggingFace Token" : "Rotate Docker Hub Token";
+  const needsUsername = modal.kind === "dockerhub" || modal.kind === "ghcr";
+  const title =
+    modal.kind === "hf"
+      ? "Rotate HuggingFace Token"
+      : modal.kind === "ghcr"
+        ? "Rotate GHCR Token"
+        : "Rotate Docker Hub Token";
 
   return (
     <div
@@ -182,7 +193,7 @@ function RotateModalComponent({
           </button>
         </div>
 
-        {modal.kind === "dockerhub" && (
+        {needsUsername && (
           <label className="block mb-4">
             <div className="eyebrow mb-1">Username</div>
             <input
@@ -209,7 +220,7 @@ function RotateModalComponent({
               autoComplete="off"
               spellCheck={false}
               className="flex-1 bg-surface-0 border border-line px-3 py-2 font-mono text-[12.5px] text-ink-0 focus:outline-none focus:border-signal"
-              placeholder={modal.kind === "hf" ? "hf_..." : "dckr_pat_..."}
+              placeholder={modal.kind === "hf" ? "hf_..." : modal.kind === "ghcr" ? "ghp_... (read:packages)" : "dckr_pat_..."}
             />
             <button
               type="button"
@@ -234,7 +245,7 @@ function RotateModalComponent({
           </button>
           <button
             type="submit"
-            disabled={submitting || !token || (modal.kind === "dockerhub" && !username)}
+            disabled={submitting || !token || (needsUsername && !username)}
             className="btn btn-primary"
           >
             {submitting ? "SAVING…" : "SAVE"}
@@ -321,6 +332,19 @@ function CredentialsCard({
     }
   }
 
+  async function handleClearGHCR() {
+    if (!confirm("Delete the platform GHCR token? The ECR pull-through cache will fail to hydrate new llm-d-aws (multi-node PP) images until a new token is provided.")) {
+      return;
+    }
+    setClearing(true);
+    try {
+      await deleteGHCRToken();
+      onChanged();
+    } finally {
+      setClearing(false);
+    }
+  }
+
   return (
     <CollapsibleSection index="A" label="Credentials" defaultOpen>
       <div className="panel px-5">
@@ -335,6 +359,12 @@ function CredentialsCard({
           meta={creds?.dockerhub_token}
           onRotate={() => setModal({ kind: "dockerhub" })}
           onDelete={clearing ? undefined : handleClearDockerHub}
+        />
+        <CredentialRow
+          label="GHCR token (llm-d-aws)"
+          meta={creds?.ghcr_token}
+          onRotate={() => setModal({ kind: "ghcr" })}
+          onDelete={clearing ? undefined : handleClearGHCR}
         />
       </div>
       <p className="meta mt-3 max-w-xl">
@@ -776,7 +806,7 @@ function RegistryCard() {
             <span className="font-mono text-[11px] tracking-mech uppercase text-ink-2">DISABLED</span>
           </div>
           <p className="meta mb-3 max-w-xl">
-            PRD-29's Docker Hub pull-through cache is not currently enabled on this cluster. To enable:
+            The ECR pull-through cache (Docker Hub + GHCR) is not currently enabled on this cluster. To enable:
           </p>
           <div className="flex items-center gap-2">
             <code className="flex-1 bg-surface-0 border border-line p-2 font-mono text-[11px] text-ink-1 whitespace-pre-wrap">
@@ -863,8 +893,9 @@ function CapacityReservationsCard() {
       <div className="panel p-5">
         <p className="meta mb-4 max-w-2xl">
           Attach EC2 on-demand capacity reservations (ODCRs) or Capacity Blocks for ML (CBRs) to the
-          GPU and Neuron Karpenter NodeClasses. Karpenter prioritizes reserved capacity over
-          on-demand; fallback to on-demand happens automatically when reservations are exhausted.
+          GPU, Neuron, and per-AZ multi-node Karpenter NodeClasses. Karpenter prioritizes reserved
+          capacity over on-demand; fallback to on-demand happens automatically when reservations are
+          exhausted. For a per-AZ multi-node pool, the reservation must be in that pool's AZ.
         </p>
         {error && <p className="caption text-danger mb-3">{error}</p>}
 
@@ -932,7 +963,17 @@ function NodePoolReservationsBlock({
       </div>
 
       <div className="caption mb-3">
-        <span className="text-ink-2">families:</span> {(pool.instance_families ?? []).join(", ") || "—"}
+        {/* Multinode pools constrain by instance-category (g/p) rather than a
+            specific family; show whichever the pool uses (PRD-66). */}
+        {(pool.instance_categories ?? []).length > 0 ? (
+          <>
+            <span className="text-ink-2">categories:</span> {pool.instance_categories.join(", ")}
+          </>
+        ) : (
+          <>
+            <span className="text-ink-2">families:</span> {(pool.instance_families ?? []).join(", ") || "—"}
+          </>
+        )}
         <span className="mx-2 text-ink-2">·</span>
         <span className="text-ink-2">AZs:</span> {(pool.subnet_azs ?? []).join(", ") || "—"}
         {!pool.capacity_type_includes_reserved && (
@@ -1077,6 +1118,8 @@ function ToolVersionsCard() {
   const [framework, setFramework] = useState("");
   const [sglang, setSGLang] = useState("");
   const [inferencePerf, setInferencePerf] = useState("");
+  const [llmd, setLLMD] = useState("");
+  const [pdVllm, setPDVllm] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1090,6 +1133,8 @@ function ToolVersionsCard() {
       setFramework(fresh.framework_version);
       setSGLang(fresh.sglang_version);
       setInferencePerf(fresh.inference_perf_version);
+      setLLMD(fresh.llmd_version);
+      setPDVllm(fresh.pd_vllm_version);
     } catch (err: any) {
       setError(err.message || "Failed to load tool versions");
     } finally {
@@ -1107,11 +1152,15 @@ function ToolVersionsCard() {
         framework_version: framework.trim(),
         sglang_version: sglang.trim(),
         inference_perf_version: inferencePerf.trim(),
+        llmd_version: llmd.trim(),
+        pd_vllm_version: pdVllm.trim(),
       });
       setTV(fresh);
       setFramework(fresh.framework_version);
       setSGLang(fresh.sglang_version);
       setInferencePerf(fresh.inference_perf_version);
+      setLLMD(fresh.llmd_version);
+      setPDVllm(fresh.pd_vllm_version);
       setSavedFlash(true);
       setTimeout(() => setSavedFlash(false), 2000);
     } catch (err: any) {
@@ -1125,7 +1174,9 @@ function ToolVersionsCard() {
     tv != null &&
     (framework.trim() !== tv.framework_version ||
       sglang.trim() !== tv.sglang_version ||
-      inferencePerf.trim() !== tv.inference_perf_version);
+      inferencePerf.trim() !== tv.inference_perf_version ||
+      llmd.trim() !== tv.llmd_version ||
+      pdVllm.trim() !== tv.pd_vllm_version);
 
   return (
     <CollapsibleSection
@@ -1137,7 +1188,7 @@ function ToolVersionsCard() {
           {error && <span className="font-mono text-[11.5px] text-danger">{error}</span>}
           <button
             onClick={handleSave}
-            disabled={saving || loading || !dirty || !framework.trim() || !sglang.trim() || !inferencePerf.trim()}
+            disabled={saving || loading || !dirty || !framework.trim() || !sglang.trim() || !inferencePerf.trim() || !llmd.trim() || !pdVllm.trim()}
             className="btn btn-primary"
           >
             {saving ? "SAVING…" : "SAVE"}
@@ -1166,9 +1217,24 @@ function ToolVersionsCard() {
               onChange={setInferencePerf}
             />
           </div>
+          <div className="grid grid-cols-3 gap-4 mb-3">
+            <LabeledInput
+              label="llm-d-aws Version (multi-node PP)"
+              value={llmd}
+              onChange={setLLMD}
+            />
+            <LabeledInput
+              label="D/P vLLM Version (disaggregated)"
+              value={pdVllm}
+              onChange={setPDVllm}
+            />
+          </div>
           <p className="meta">
             Applies to all new benchmark runs. Existing runs retain the version they were submitted with.
-            vLLM/SGLang can still be overridden per-run from the new-benchmark page; inference-perf is platform-wide.
+            vLLM/SGLang can still be overridden per-run from the new-benchmark page; inference-perf,
+            llm-d-aws (co-located pipeline-parallel), and the disaggregated D/P vLLM image are platform-wide.
+            The D/P vLLM version is intentionally separate from Framework Version — disaggregation pins a
+            NIXL-specific vLLM build.
           </p>
           {tv?.env_override_active && (
             <div className="border border-warn/40 bg-warn/5 p-3 mt-3">
@@ -1203,6 +1269,32 @@ function ToolVersionsCard() {
               <p className="caption mt-1">
                 The API pod has the <code>SGLANG_IMAGE</code> env var set — SGLang runs deploy this image verbatim.
                 Edits to SGLang Version above will be saved but ignored at runtime until the env var is removed.
+              </p>
+            </div>
+          )}
+          {tv?.llmd_env_override_active && (
+            <div className="border border-warn/40 bg-warn/5 p-3 mt-3">
+              <div className="caption text-warn mb-1">LLMD_IMAGE ENV OVERRIDE ACTIVE</div>
+              <div className="font-mono text-[11.5px] text-ink-0 break-all">
+                {tv.llmd_env_override_image}
+              </div>
+              <p className="caption mt-1">
+                The API pod has the <code>LLMD_IMAGE</code> (or <code>VLLM_IMAGE</code>) env var set — co-located
+                multi-node runs deploy this image verbatim. Edits to llm-d-aws Version above will be saved but ignored
+                at runtime until the env var is removed.
+              </p>
+            </div>
+          )}
+          {tv?.pd_vllm_env_override_active && (
+            <div className="border border-warn/40 bg-warn/5 p-3 mt-3">
+              <div className="caption text-warn mb-1">PD_MODEL_IMAGE ENV OVERRIDE ACTIVE</div>
+              <div className="font-mono text-[11.5px] text-ink-0 break-all">
+                {tv.pd_vllm_env_override_image}
+              </div>
+              <p className="caption mt-1">
+                The API pod has the <code>PD_MODEL_IMAGE</code> (or <code>VLLM_IMAGE</code>) env var set — disaggregated
+                D/P runs deploy this image verbatim. Edits to D/P vLLM Version above will be saved but ignored at
+                runtime until the env var is removed.
               </p>
             </div>
           )}

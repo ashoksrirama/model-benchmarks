@@ -6,7 +6,7 @@ variable "cluster_name" {
 variable "cluster_version" {
   description = "Kubernetes version for the EKS cluster"
   type        = string
-  default     = "1.31"
+  default     = "1.36"
 }
 
 variable "vpc_id" {
@@ -34,4 +34,10 @@ variable "enable_cluster_creator_admin_permissions" {
   description = "Grant cluster-admin to the IAM principal that runs terraform apply. Disable on pre-existing clusters where the principal already has an access entry."
   type        = bool
   default     = true
+}
+
+variable "cluster_admin_principal_arns" {
+  description = "IAM principal ARNs to grant cluster-admin via an EKS access entry + AmazonEKSClusterAdminPolicy. Codifies the apply principal so the kube/helm/kubectl providers can authenticate."
+  type        = list(string)
+  default     = []
 }

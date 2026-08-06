@@ -27,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -44,6 +45,113 @@ type RunConfig struct {
 	Model        *database.Model
 	InstanceType *database.InstanceType
 	Request      *database.RunRequest
+
+	// PRD-56: multi-node topology. Lives on RunConfig (the in-memory
+	// execution config), NOT on database.RunRequest — persisting it is
+	// PRD-57's job. Zero values mean a single-node run (the default,
+	// byte-for-byte the existing path). Set only when the run selects the
+	// "llm-d" framework; a hand-built RunConfig exercises this in PRD-56.
+	//
+	// NodeCount is the LeaderWorkerSet group size (number of GPU nodes).
+	// PipelineParallelDegree is pipeline shards across nodes; TP within a
+	// node comes from Request.TensorParallelDegree. GPUsPerNode defaults to
+	// the instance's accelerator count when zero.
+	NodeCount              int
+	PipelineParallelDegree int
+	GPUsPerNode            int
+
+	// NodePoolOverride pins the run to a specific static multinode NodePool
+	// (e.g. "multinode-us-east-2a"). Empty = auto-select, preferring pools
+	// backed by a capacity reservation / Capacity Block (see
+	// selectMultinodePool). PRD-57's UI can surface this so a user picks a
+	// pool/AZ explicitly.
+	NodePoolOverride string
+
+	// NetworkMode selects the cross-node collective fabric for a distributed
+	// run: NetworkModeEFA (default, preferred — EFA/RDMA) or NetworkModeTCP
+	// (NCCL over plain sockets, no EFA devices claimed). TCP lets users
+	// benchmark multi-node on GPU instances that lack EFA (or when EFA
+	// capacity is unavailable), at a throughput cost. Empty ⇒ EFA.
+	NetworkMode string
+
+	// PRD-58: prefill/decode disaggregation. Set only when the run is
+	// disaggregated (Request.DeploymentMode == "disaggregated"). Per-role
+	// replica counts (the xPyD ratio) + within-node TP. Each pod occupies one
+	// node (TP is within-node, per-role PP is fixed at 1), so the run's total
+	// node count is PrefillReplicas + DecodeReplicas — set into NodeCount by the
+	// caller so the shared pool-acquire / scale / teardown / cost / DCGM paths
+	// (which key on NodeCount) work unchanged.
+	PrefillReplicas int
+	PrefillTP       int
+	DecodeReplicas  int
+	DecodeTP        int
+	// PRD-63: optional co-located "both" pool (prefill+decode fused). 0 ⇒ no
+	// both pool (today's PD behavior). NodeCount includes BothReplicas so the
+	// shared pool-acquire / scale / teardown / cost paths key on the total.
+	BothReplicas int
+	BothTP       int
+	// PRD-64: optional per-role scheduler override (0 ⇒ inherit the shared
+	// Request.MaxNumBatchedTokens). Prefill compute-bound wants a larger budget;
+	// decode memory-bound. Only consulted for disaggregated runs. PRD-63 adds
+	// the symmetric knob for the "both" role.
+	PrefillMaxNumBatchedTokens int
+	DecodeMaxNumBatchedTokens  int
+	BothMaxNumBatchedTokens    int
+
+	// PRD-61: run-tunable EPP routing config (disaggregated only). Each nil/0 ⇒
+	// the orchestrator applies the shipped default, so a run that sets nothing is
+	// byte-identical to pre-PRD-61. NonCachedTokens is a POINTER because 0 is a
+	// MEANINGFUL value (disable disaggregation) that must be distinguishable from
+	// "unset" — the others use 0 = unset since 0 is not a valid weight/size.
+	PDNonCachedTokens        *int
+	PDPrefixCacheScorerWeight int
+	PDQueueScorerWeight       int
+	PDMaxPrefixBlocks         int
+	PDLRUCapacityPerServer    int
+	// PDDeciderStrategy selects the disaggregation decider; only "threshold"
+	// (default) is rendered today. "always" is gated on peakPrefillThroughput
+	// calibration (out of scope) — persisted for forward-compat but not rendered.
+	PDDeciderStrategy string
+}
+
+// Deployment sub-modes (PRD-57/58). Request.DeploymentMode carries these.
+const (
+	DeploymentModeDistributed   = "distributed"   // co-located multi-node (PRD-56/57)
+	DeploymentModeDisaggregated = "disaggregated" // prefill/decode split (PRD-58)
+)
+
+// Cross-node fabric modes for distributed runs (PRD-56).
+const (
+	NetworkModeEFA = "efa" // EFA/RDMA via libfabric — preferred, default.
+	NetworkModeTCP = "tcp" // NCCL over TCP sockets — no EFA required.
+)
+
+// networkMode returns the effective fabric mode, defaulting to EFA.
+func (c RunConfig) networkMode() string {
+	if c.NetworkMode == NetworkModeTCP {
+		return NetworkModeTCP
+	}
+	return NetworkModeEFA
+}
+
+// IsDistributed reports whether this run uses the multi-node deploy path:
+// the framework is a multi-node runtime AND a node count > 1 was requested.
+// True for BOTH co-located distributed and disaggregated runs — both need the
+// pool-acquire / scale / teardown / multi-node-DCGM machinery.
+func (c RunConfig) IsDistributed() bool {
+	rt, err := runtime.Get(c.Request.Framework)
+	if err != nil {
+		return false
+	}
+	return runtime.IsMultiNode(rt) && c.NodeCount > 1
+}
+
+// IsDisaggregated reports whether this run splits prefill and decode into
+// separate pod groups (PRD-58). A subset of IsDistributed: it additionally
+// routes deployModel/waitForReady to the PD object graph (two Deployments +
+// InferencePool + EPP) instead of the co-located LeaderWorkerSet.
+func (c RunConfig) IsDisaggregated() bool {
+	return c.IsDistributed() && c.Request.DeploymentMode == DeploymentModeDisaggregated
 }
 
 // Orchestrator manages the benchmark lifecycle.
@@ -58,8 +166,19 @@ type Orchestrator struct {
 	repo        database.Repo
 	oomDetector *oom.Detector
 	secrets     HFTokenResolver // optional; nil = no auto-injection
+	// PRD-56: dynamic client for applying/deleting CRDs (LeaderWorkerSet,
+	// InferencePool, HTTPRoute, ResourceClaimTemplate) that the typed
+	// clientset can't create, plus patching the static Karpenter NodePool's
+	// replica count. nil = single-node only (multi-node runs are rejected).
+	// Injected via SetDynamicClient after construction, mirroring how the
+	// API server receives its dynamic client (PRD-33).
+	dynClient dynamic.Interface
 	mu          sync.Mutex
 	cancels     map[string]context.CancelFunc // runID → cancel
+	// PRD-56: per-run distributed state (applied CRD graph + scaled NodePool),
+	// so teardown deletes exactly what was created and returns the pool to 0.
+	// Guarded by mu. Empty/absent for single-node runs.
+	distributed map[string]*distributedState
 	// PRD-40: this pod's hostname. Written into benchmark_runs.owner_pod +
 	// test_suite_runs.owner_pod when Execute starts so orphan recovery on
 	// sibling pods can attribute ownership.
@@ -73,14 +192,33 @@ func New(client kubernetes.Interface, repo database.Repo, hostname string) *Orch
 		repo:        repo,
 		oomDetector: oom.NewDetector(client, defaultNamespace),
 		cancels:     make(map[string]context.CancelFunc),
+		distributed: make(map[string]*distributedState),
 		hostname:    hostname,
 	}
+}
+
+// distributedState records what a multi-node run allocated so teardown can
+// undo it precisely: the applied CRD/Service graph and the scaled NodePool.
+// Keyed in o.distributed by the run's modelName ("bench-<runID[:8]>"), which
+// both Execute and cleanupResources derive identically — so teardown reaches
+// the state without threading the full runID through its signature.
+type distributedState struct {
+	poolName string          // the multinode NodePool scaled out (empty = none)
+	applied  []appliedObject // CRDs + Service applied via the dynamic client
 }
 
 // SetSecretsStore enables HF token auto-injection. Called from the API server
 // after construction; leaving it unset falls back to per-request tokens only.
 func (o *Orchestrator) SetSecretsStore(s HFTokenResolver) {
 	o.secrets = s
+}
+
+// SetDynamicClient injects the client-go dynamic client (PRD-56). Called from
+// the API server after construction with the same in-cluster client the
+// reservations handlers use. Leaving it nil disables the multi-node deploy
+// path — distributed runs are rejected at Execute time with a clear error.
+func (o *Orchestrator) SetDynamicClient(dc dynamic.Interface) {
+	o.dynClient = dc
 }
 
 // resolveHFToken returns the per-request token when set, otherwise the
@@ -174,6 +312,19 @@ func (o *Orchestrator) Execute(ctx context.Context, cfg RunConfig) error {
 	// Ensure teardown happens regardless of outcome.
 	defer o.teardown(context.Background(), ns, modelName, loadgenName, configMapName)
 
+	// PRD-56 Layer 3: for a distributed run, claim the shared multi-node pool
+	// (serialized — one at a time) and scale it out before deploying. The
+	// pool is scaled back to 0 by teardown (registered above). Runs before
+	// deployModel so nodes exist when the LeaderWorkerSet schedules.
+	if cfg.IsDistributed() {
+		log.Printf("[%s] distributed run: %d nodes, TP=%d PP=%d",
+			cfg.RunID[:8], cfg.NodeCount, cfg.Request.TensorParallelDegree, cfg.PipelineParallelDegree)
+		if err := o.acquireDistributedPool(ctx, ns, modelName, cfg); err != nil {
+			o.markFailed(ctx, cfg.RunID, fmt.Sprintf("acquire distributed pool: %v", err))
+			return fmt.Errorf("acquire distributed pool: %w", err)
+		}
+	}
+
 	// Phase 2: Deploy model Deployment + Service.
 	log.Printf("[%s] deploying model %s on %s", cfg.RunID[:8], cfg.Request.ModelHfID, cfg.Request.InstanceTypeName)
 	if err := o.deployModel(ctx, ns, modelName, cfg); err != nil {
@@ -214,14 +365,62 @@ func (o *Orchestrator) Execute(ctx context.Context, cfg RunConfig) error {
 	var gpuScraper *GPUScraper
 	if strings.EqualFold(cfg.InstanceType.AcceleratorType, "gpu") {
 		totalMemGiB := float64(cfg.InstanceType.AcceleratorMemoryGiB)
-		// Try to get node IP for DCGM metrics
-		nodeIP := o.getModelPodNodeIP(ctx, ns, modelName)
-		if nodeIP != "" {
-			log.Printf("[%s] DCGM scraping enabled (node %s)", cfg.RunID[:8], nodeIP)
+		if cfg.IsDistributed() {
+			// PRD-56/58: GPUs live on every group node — fan DCGM out across all.
+			// vLLM metrics come from the serving Service: "<name>-svc" (co-located
+			// LWS leader) or, for a disaggregated run, "<name>-decode" (decode does
+			// the token generation, so its serving metrics are the relevant ones;
+			// per-role metric attribution is PRD-59). The DCGM node fan-out below
+			// covers BOTH roles' nodes via the shared app.kubernetes.io/name label.
+			metricsSvc := modelName + "-svc"
+			if cfg.IsDisaggregated() {
+				// Decode does the token generation, so its serving metrics are the
+				// relevant ones. PRD-63: a "both"-only run has no decode Service —
+				// fall back to the both (then prefill) Service so the vLLM-metrics
+				// target still resolves. (DCGM still fans out across ALL role nodes
+				// via the shared app.kubernetes.io/name label, independent of this.)
+				switch {
+				case cfg.DecodeReplicas > 0:
+					metricsSvc = modelName + "-decode"
+				case cfg.BothReplicas > 0:
+					metricsSvc = modelName + "-both"
+				default:
+					metricsSvc = modelName + "-prefill"
+				}
+			}
+			// PRD-59: keyed scraper — bucket DCGM samples per {node, role} so the
+			// distributed report can show per-node/per-role GPU telemetry and an
+			// honest group memory total. Role comes from the pod's llm-d.ai/role
+			// label (prefill/decode; empty for co-located).
+			nodes := o.llmdServingNodes(ctx, ns, modelName)
+			log.Printf("[%s] DCGM scraping enabled across %d serving node(s) (keyed)", cfg.RunID[:8], len(nodes))
+			// Total memory scales with the group: per-instance accel memory × nodes.
+			gpuScraper = NewGPUScraperKeyed(metricsSvc, 8000, totalMemGiB*float64(cfg.NodeCount), nodes)
+		} else {
+			// Try to get node IP for DCGM metrics
+			nodeIP := o.getModelPodNodeIP(ctx, ns, modelName)
+			if nodeIP != "" {
+				log.Printf("[%s] DCGM scraping enabled (node %s)", cfg.RunID[:8], nodeIP)
+			}
+			gpuScraper = NewGPUScraperWithDCGM(modelName, 8000, totalMemGiB, nodeIP)
 		}
-		gpuScraper = NewGPUScraperWithDCGM(modelName, 8000, totalMemGiB, nodeIP)
 		gpuScraper.Start(ctx)
 		log.Printf("[%s] started GPU metrics scraper", cfg.RunID[:8])
+	}
+
+	// PRD-62: for a DISAGGREGATED run, additionally scrape the per-role vLLM
+	// PD/KV counters + the EPP's disaggregation-decision metrics. Started only
+	// here (never for single-node or co-located runs), non-fatal, stopped with
+	// the GPU scraper below.
+	var pdScraper *PDScraper
+	if cfg.IsDisaggregated() {
+		vllmTargets, eppURL := o.pdMetricsTargets(ctx, ns, modelName)
+		if len(vllmTargets) > 0 || eppURL != "" {
+			pdScraper = NewPDScraper(vllmTargets, eppURL)
+			pdScraper.Start(ctx)
+			log.Printf("[%s] started PD/KV metrics scraper (%d vLLM target(s), epp=%t)",
+				cfg.RunID[:8], len(vllmTargets), eppURL != "")
+		}
 	}
 
 	// Phase 4: Launch load generator Job.
@@ -232,6 +431,9 @@ func (o *Orchestrator) Execute(ctx context.Context, cfg RunConfig) error {
 	if err := o.launchLoadgen(ctx, ns, loadgenName, modelName, cfg); err != nil {
 		if gpuScraper != nil {
 			gpuScraper.Stop()
+		}
+		if pdScraper != nil {
+			pdScraper.Stop()
 		}
 		o.markFailed(ctx, cfg.RunID, fmt.Sprintf("launch loadgen: %v", err))
 		return fmt.Errorf("launch loadgen: %w", err)
@@ -251,6 +453,19 @@ func (o *Orchestrator) Execute(ctx context.Context, cfg RunConfig) error {
 				gpuMetrics.MemoryPeakGiB, gpuMetrics.WaitingRequestsMax)
 		} else {
 			log.Printf("[%s] GPU scraper collected no samples", cfg.RunID[:8])
+		}
+	}
+
+	// PRD-62: stop the PD/KV scraper and collect the run-level disaggregation
+	// summary. Nil when nothing was collected (non-disaggregated, or the series
+	// never populated — e.g. older NIXL / unreachable EPP).
+	var pdMetrics *PDMetrics
+	if pdScraper != nil {
+		pdMetrics = pdScraper.Stop()
+		if pdMetrics != nil && pdMetrics.DisaggEngagedRatePct != nil {
+			log.Printf("[%s] PD metrics: disagg-engaged=%.0f%% kv-xfer-avg=%.2fms",
+				cfg.RunID[:8], *pdMetrics.DisaggEngagedRatePct,
+				derefF(pdMetrics.KVTransferTimeAvgMs))
 		}
 	}
 
@@ -285,6 +500,15 @@ func (o *Orchestrator) Execute(ctx context.Context, cfg RunConfig) error {
 		computed.AcceleratorMemoryAvgGiB = &gpuMetrics.MemoryAvgGiB
 		computed.WaitingRequestsMax = &gpuMetrics.WaitingRequestsMax
 
+		// PRD-59: distributed runs carry the honest group memory total + the
+		// per-node/per-role breakdown. Both are zero/empty on the single-node
+		// (flat) path, so single-instance rows are unchanged.
+		if cfg.IsDistributed() {
+			memTotal := gpuMetrics.MemoryTotalGiB
+			computed.AcceleratorMemoryTotalGiB = &memTotal
+			computed.Shards = shardMetricsToDB(cfg.RunID, gpuMetrics.Shards)
+		}
+
 		// Extended metrics (PRD-14)
 		computed.PromptThroughputTPS = &gpuMetrics.PromptThroughputTPS
 		computed.GenerationThroughputTPS = &gpuMetrics.GenerationThroughputTPS
@@ -303,6 +527,22 @@ func (o *Orchestrator) Execute(ctx context.Context, cfg RunConfig) error {
 		computed.TensorActivePeakPct = gpuMetrics.TensorActivePeakPct
 		computed.DRAMActiveAvgPct = gpuMetrics.DRAMActiveAvgPct
 		computed.DRAMActivePeakPct = gpuMetrics.DRAMActivePeakPct
+	}
+
+	// PRD-62: merge the run-level disaggregation summary (nil-safe; all pointers,
+	// so absent series stay NULL). Only set for disaggregated runs.
+	if pdMetrics != nil {
+		computed.KVTransferTimeAvgMs = pdMetrics.KVTransferTimeAvgMs
+		computed.KVTransferBytesTotal = pdMetrics.KVTransferBytesTotal
+		computed.KVTransferFailures = pdMetrics.KVTransferFailures
+		computed.PrefillTimeServerAvgMs = pdMetrics.PrefillTimeAvgMs
+		computed.DecodeTimeServerAvgMs = pdMetrics.DecodeTimeAvgMs
+		computed.ExternalPrefixCacheHitRate = pdMetrics.ExternalPrefixCacheHitRate
+		computed.DisaggPrefillDecodeCount = pdMetrics.DisaggPrefillDecodeCount
+		computed.DisaggDecodeOnlyCount = pdMetrics.DisaggDecodeOnlyCount
+		computed.DisaggEngagedRatePct = pdMetrics.DisaggEngagedRatePct
+		computed.PoolKVCacheUtilPct = pdMetrics.PoolKVCacheUtilPct
+		computed.PoolQueueSizeAvg = pdMetrics.PoolQueueSizeAvg
 	}
 
 	if err := o.repo.PersistMetrics(ctx, cfg.RunID, computed); err != nil {
@@ -326,7 +566,46 @@ func (o *Orchestrator) Execute(ctx context.Context, cfg RunConfig) error {
 	return nil
 }
 
+// resolveS3Model decides how a run loads its model weights (PRD-65 Layer 2).
+// Precedence, matching the single-node reference:
+//  1. an explicit Request.ModelS3URI wins (stream from that S3 path);
+//  2. else, if the HF model is cached in S3 (GetModelCacheByHfID, status
+//     "cached"), auto-detect it and stream;
+//  3. else HF download, no streamer.
+// Returns (s3URI, useRunai). Path-agnostic so single-node, D/P, and (later) PP
+// all share one cached-model policy — the multi-node paths previously only
+// honored an explicit URI and never consulted the cache.
+func (o *Orchestrator) resolveS3Model(ctx context.Context, cfg RunConfig) (string, bool) {
+	if cfg.Request.ModelS3URI != "" {
+		log.Printf("[%s] using S3 model: %s", cfg.RunID[:8], cfg.Request.ModelS3URI)
+		return cfg.Request.ModelS3URI, true
+	}
+	if cfg.Request.ModelHfID != "" {
+		revision := cfg.Request.ModelHfRevision
+		if revision == "" {
+			revision = "main"
+		}
+		cached, _ := o.repo.GetModelCacheByHfID(ctx, cfg.Request.ModelHfID, revision)
+		if cached != nil && cached.Status == "cached" {
+			log.Printf("[%s] auto-detected cached model: %s", cfg.RunID[:8], cached.S3URI)
+			return cached.S3URI, true
+		}
+	}
+	return "", false
+}
+
 func (o *Orchestrator) deployModel(ctx context.Context, ns, name string, cfg RunConfig) error {
+	// PRD-58: disaggregated runs render the prefill/decode object graph
+	// (two Deployments + InferencePool + EPP). PRD-56: co-located multi-node
+	// runs render the llm-d LWS object graph. Both apply via the dynamic
+	// client. Single-node runs take the unchanged typed-Deployment path below.
+	if cfg.IsDisaggregated() {
+		return o.deployLLMDDisaggregated(ctx, ns, name, cfg)
+	}
+	if cfg.IsDistributed() {
+		return o.deployLLMD(ctx, ns, name, cfg)
+	}
+
 	// Reserve headroom for kubelet, kube-proxy, and OS overhead.
 	// Request ~75% of instance vCPUs and ~85% of memory.
 	vcpus := cfg.InstanceType.VCPUs
@@ -334,26 +613,7 @@ func (o *Orchestrator) deployModel(ctx context.Context, ns, name string, cfg Run
 	cpuReq := fmt.Sprintf("%d", max(1, vcpus*3/4))
 	memReq := fmt.Sprintf("%dGi", max(1, memGiB*85/100))
 
-	var modelS3URI string
-	var useRunai bool
-	if cfg.Request.ModelS3URI != "" {
-		modelS3URI = cfg.Request.ModelS3URI
-		useRunai = true
-		log.Printf("[%s] using S3 model: %s", cfg.RunID[:8], modelS3URI)
-	}
-
-	if modelS3URI == "" && cfg.Request.ModelHfID != "" {
-		revision := cfg.Request.ModelHfRevision
-		if revision == "" {
-			revision = "main"
-		}
-		cached, _ := o.repo.GetModelCacheByHfID(ctx, cfg.Request.ModelHfID, revision)
-		if cached != nil && cached.Status == "cached" {
-			modelS3URI = cached.S3URI
-			useRunai = true
-			log.Printf("[%s] auto-detected cached model: %s", cfg.RunID[:8], modelS3URI)
-		}
-	}
+	modelS3URI, useRunai := o.resolveS3Model(ctx, cfg)
 
 	// PRD-50 follow-up: the streamer is always used for S3-backed
 	// models. vLLM's default loader against an S3 URI fails in
@@ -453,6 +713,16 @@ func (o *Orchestrator) deployModel(ctx context.Context, ns, name string, cfg Run
 }
 
 func (o *Orchestrator) waitForReady(ctx context.Context, ns, name string, cfg RunConfig) error {
+	// PRD-58: disaggregated runs wait on BOTH the prefill and decode
+	// Deployments + the EPP before the loadgen can route.
+	if cfg.IsDisaggregated() {
+		return o.waitForDisaggregatedReady(ctx, ns, name, cfg)
+	}
+	// PRD-56: co-located multi-node runs poll the LeaderWorkerSet group status
+	// instead of a Deployment's ReadyReplicas.
+	if cfg.IsDistributed() {
+		return o.waitForLWSReady(ctx, ns, name, cfg)
+	}
 	deadline := time.Now().Add(readinessTimeout)
 	for time.Now().Before(deadline) {
 		dep, err := o.client.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
@@ -500,7 +770,15 @@ func (o *Orchestrator) launchLoadgen(ctx context.Context, ns, name, modelSvc str
 	if s == nil {
 		return fmt.Errorf("unknown scenario: %s", cfg.Request.ScenarioID)
 	}
-	inferencePerfConfig := s.ToInferencePerfConfig(cfg.Request.ModelHfID, modelSvc, 8000)
+	// PRD-56: distributed runs target the shared Envoy AI Gateway (ClusterIP)
+	// instead of the model Service. inference-perf is unchanged — it's a
+	// drop-in swap of the target host/port.
+	targetHost, targetPort := modelSvc, 8000
+	if cfg.IsDistributed() {
+		targetHost, targetPort = o.gatewayLoadgenTarget(ctx)
+		log.Printf("[%s] loadgen targeting gateway %s:%d", cfg.RunID[:8], targetHost, targetPort)
+	}
+	inferencePerfConfig := s.ToInferencePerfConfig(cfg.Request.ModelHfID, targetHost, targetPort)
 	log.Printf("[%s] using scenario %q: %s", cfg.RunID[:8], s.ID, s.Name)
 
 	// Allow dataset override from request
@@ -734,6 +1012,12 @@ func (o *Orchestrator) teardown(ctx context.Context, ns, modelName, loadgenName,
 	if configMapName != "" {
 		_ = o.client.CoreV1().ConfigMaps(ns).Delete(ctx, configMapName, metav1.DeleteOptions{})
 	}
+
+	// PRD-56: for a distributed run, delete the llm-d object graph (LWS +
+	// gateway route + DRA claims) and scale the NodePool back to 0. No-op for
+	// single-node runs (nothing recorded under modelName). Deleting the LWS's
+	// pods first (above/here) lets nodes drain before scale-in.
+	o.teardownDistributed(ctx, ns, modelName)
 }
 
 // createConfigMap creates a ConfigMap with the given data.
@@ -811,6 +1095,10 @@ func (o *Orchestrator) applyYAML(ctx context.Context, ns, yamlStr string) error 
 				return err
 			}
 		default:
+			// The single-node path only ever renders the three typed kinds
+			// above. Custom resources (the multi-node llm-d object graph) are
+			// applied via the dynamic client through applyManifestSet, which
+			// also tracks them for teardown — not through this typed path.
 			return fmt.Errorf("unsupported resource kind: %s", meta.Kind)
 		}
 	}
@@ -849,6 +1137,25 @@ func derefStr(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// derefF dereferences a *float64, returning 0 for nil (log/display convenience).
+func derefF(f *float64) float64 {
+	if f == nil {
+		return 0
+	}
+	return *f
+}
+
+// valOrDefault returns v when it's a positive "set" value, else def. Used by the
+// PRD-61 routing knobs where 0 means "unset → use the shipped default" (weights
+// and sizes are never legitimately 0; nonCachedTokens, where 0 IS meaningful,
+// uses a pointer instead).
+func valOrDefault(v, def int) int {
+	if v > 0 {
+		return v
+	}
+	return def
 }
 
 // RecoverOrphanedRuns checks for runs stuck in "running" status and attempts

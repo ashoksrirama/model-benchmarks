@@ -10,6 +10,18 @@ variable "project_name" {
   default     = "accelbench"
 }
 
+variable "force_destroy_buckets" {
+  description = <<-EOT
+    Allow `terraform destroy` to delete S3 buckets that still contain
+    objects. Defaults to false so a normal destroy can't silently wipe
+    cached model weights or results. Set to true for an intentional
+    teardown (avoids the manual `aws s3 rm --recursive` step that a
+    non-empty models bucket otherwise forces).
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "vpc_cidr" {
   description = "CIDR block for the VPC"
   type        = string
@@ -19,13 +31,59 @@ variable "vpc_cidr" {
 variable "cluster_version" {
   description = "Kubernetes version for the EKS cluster"
   type        = string
-  default     = "1.31"
+  default     = "1.36"
 }
 
 variable "karpenter_version" {
   description = "Karpenter Helm chart version"
   type        = string
-  default     = "1.9.0"
+  default     = "1.14.0"
+}
+
+# ---------- Multi-node / distributed inference (PRD-55) ----------
+
+variable "enable_multinode" {
+  description = <<-EOT
+    Provision the distributed-inference foundations: one EC2 cluster
+    placement group + one static EFA GPU Karpenter NodePool per AZ, and
+    the DRA drivers (NVIDIA GPU + AWS DRANET/EFA). Greenfield only. Off by
+    default — the single-instance platform is unaffected. Requires EKS
+    1.34+ and Karpenter >= v1.11.
+  EOT
+  type        = bool
+  default     = false
+}
+
+# Serving-stack chart/CRD versions (gateway.tf). Pinned; verified against
+# each project's GitHub releases. LWS chart version has NO `v` prefix.
+variable "lws_version" {
+  description = "LeaderWorkerSet Helm chart version (oci://registry.k8s.io/lws/charts/lws)."
+  type        = string
+  default     = "0.9.0"
+}
+
+variable "gateway_api_version" {
+  description = "Gateway API release tag for standard-install.yaml CRDs."
+  type        = string
+  default     = "v1.6.1"
+}
+
+variable "inference_extension_version" {
+  description = "Gateway API Inference Extension release tag for manifests.yaml (InferencePool v1 GA)."
+  type        = string
+  default     = "v1.5.0"
+}
+
+variable "envoy_gateway_version" {
+  description = "Envoy Gateway Helm chart version (oci://docker.io/envoyproxy/gateway-helm)."
+  type        = string
+  default     = "v1.8.3"
+}
+
+variable "envoy_ai_gateway_version" {
+  description = "Envoy AI Gateway version — shared by ai-gateway-crds-helm + ai-gateway-helm, and the envoy-gateway-values.yaml ref."
+  type        = string
+  default     = "v1.0.0"
 }
 
 variable "aurora_min_capacity" {
@@ -38,6 +96,18 @@ variable "aurora_max_capacity" {
   description = "Maximum ACU capacity for Aurora Serverless v2"
   type        = number
   default     = 4
+}
+
+# Master-user-password rotation. Default false = rotation OFF (desired steady
+# state — nothing syncs a rotated RDS password into the K8s accelbench-db secret,
+# so rotation breaks DB auth). RDS enables rotation by default when it manages the
+# password; disabling requires a ONE-TIME transition apply with this set to true
+# (Terraform adopts the rotation resource, rotate_immediately=false), then a second
+# apply back to false which disables it. Steady state stays false.
+variable "manage_master_user_password_rotation" {
+  description = "One-time escape hatch to disable RDS's default master-password rotation via a true->false apply. Keep false in steady state."
+  type        = bool
+  default     = false
 }
 
 variable "tags" {
@@ -59,6 +129,22 @@ variable "dockerhub_access_token" {
   default     = ""
 }
 
+# PRD-66 Part 2a: GHCR pull-through for the co-located PP image (llm-d-aws).
+# GHCR requires auth even for public images. The token is a GitHub PAT with the
+# read:packages scope; secret → gitignored tfvars like dockerhub_access_token.
+variable "github_username" {
+  description = "GitHub username for the GHCR ECR pull-through cache. Set via terraform.tfvars or -var."
+  type        = string
+  default     = ""
+}
+
+variable "github_token" {
+  description = "GitHub PAT (read:packages scope) for the GHCR ECR pull-through cache. Set via terraform.tfvars or -var."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
 variable "enable_cluster_creator_admin_permissions" {
   description = <<-EOT
     Whether the EKS module creates a cluster-admin access entry for the IAM
@@ -69,6 +155,23 @@ variable "enable_cluster_creator_admin_permissions" {
   EOT
   type        = bool
   default     = true
+}
+
+variable "cluster_admin_principal_arns" {
+  description = <<-EOT
+    IAM principal ARNs (users/roles) to grant cluster-admin via an EKS
+    access entry + AmazonEKSClusterAdminPolicy association. The operator
+    passes in the principal that runs `terraform apply` (and any others
+    that need kubectl/Helm access), e.g.
+      cluster_admin_principal_arns = ["arn:aws:iam::<acct>:user/kubernetes"]
+    Observed: enable_cluster_creator_admin_permissions alone did NOT create
+    an entry for the apply principal on greenfield builds, so the
+    kube/helm/kubectl providers failed to authenticate mid-apply. Setting
+    this codifies the manual access-entry step that unblocked those builds.
+    Empty (default) creates none — relies on the module's creator-admin.
+  EOT
+  type        = list(string)
+  default     = []
 }
 
 variable "manage_cluster" {

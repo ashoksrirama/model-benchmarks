@@ -15,6 +15,32 @@ rules:
   - apiGroups: [""]
     resources: ["nodes/proxy"]
     verbs: ["get"]
+  # PRD-56: count Ready + DRA-labeled nodes when scaling the static multi-node
+  # NodePool 0→N and back (waitForNodes / reapLeakedDistributedPools).
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+  # PRD-65 fail-fast: read NodeClaim InsufficientCapacityError events so
+  # waitForNodes can abort a scale-out in seconds (poolHitCapacityError) instead
+  # of grinding to the 20-min provision timeout when an AZ has no capacity.
+  # Cluster-scoped: Karpenter NodeClaims are cluster-scoped, so their events land
+  # in the "default" namespace, not accelbench. Read-only. (Without this the List
+  # was silently 403'd and fail-fast never tripped.)
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list"]
+  # PRD-56: resolve the Envoy AI Gateway's backing Service (generated name in
+  # envoy-gateway-system) so the loadgen can target the gateway ClusterIP.
+  # Cluster-scoped because that Service lives outside the accelbench namespace.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list"]
+  # PRD-56: gate distributed readiness on the leader Service having a ready
+  # endpoint (the gateway's routing precondition) — closes the race where the
+  # LWS reports group-ready before the leader's API server is serving.
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list"]
   # PRD-33: Capacity Reservations card patches Karpenter CRDs to attach
   # ODCRs/CBRs to the GPU + Neuron EC2NodeClasses and keep the NodePools'
   # capacity-type requirement including 'reserved'.
@@ -24,6 +50,26 @@ rules:
   - apiGroups: ["karpenter.sh"]
     resources: ["nodepools"]
     verbs: ["get", "list", "patch"]
+  # PRD-58: a disaggregated run renders the Endpoint Picker's cluster-scoped
+  # auth RBAC (a ClusterRole + ClusterRoleBinding granting the EPP SA
+  # tokenreviews/subjectaccessreviews for metrics scraping). The orchestrator
+  # creates + deletes them per run, so it needs create/delete here. Scoped to
+  # get/list/create/delete (NOT bind/escalate/*) to limit the privilege-
+  # escalation surface of granting an app pod ClusterRole write.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles", "clusterrolebindings"]
+    verbs: ["get", "list", "create", "delete"]
+  # The K8s privilege-escalation guard requires the orchestrator to HOLD the
+  # verbs it delegates: the EPP ClusterRole it renders grants tokenreviews +
+  # subjectaccessreviews (create) and /metrics (get), so grant those here too.
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -66,6 +112,45 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "pods/log"]
     verbs: ["get", "list", "watch"]
+  # PRD-56: multi-node llm-d deploy path. The orchestrator applies + deletes
+  # the object graph a distributed run needs (LeaderWorkerSet, HTTPRoute,
+  # ResourceClaimTemplate) alongside the typed kinds above, and holds a
+  # ConfigMap lock (create/delete already granted via configmaps). The gateway
+  # routes straight to the leader Service; InferencePool + Endpoint Picker are
+  # deferred to PRD-58.
+  - apiGroups: ["leaderworkerset.x-k8s.io"]
+    resources: ["leaderworkersets"]
+    verbs: ["get", "list", "create", "delete"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes"]
+    verbs: ["get", "list", "create", "delete"]
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceclaimtemplates"]
+    verbs: ["get", "list", "create", "delete"]
+  # PRD-58: prefill/decode disaggregation adds the Gateway API InferencePool
+  # (the KV/role/load-aware routing pool) and the Endpoint Picker's namespaced
+  # RBAC (a ServiceAccount + Role + RoleBinding). deployments/services/
+  # configmaps (the EPP Deployment/Service/config) are already granted above.
+  #
+  # NOTE: Kubernetes' privilege-escalation guard requires that to CREATE a Role
+  # granting verbs V on resource R, the creator must itself HOLD V on R. The EPP
+  # Role the orchestrator renders grants pods (get/watch/list), inferencepools
+  # (get/watch/list), and inference.networking.x-k8s.io inferenceobjectives/
+  # inferencemodelrewrites (get/watch/list) — so the orchestrator must hold all
+  # of those verbs here, hence the full get/list/watch on inferencepools and the
+  # x-k8s.io reads below (pods get/list/watch is already granted above).
+  - apiGroups: ["inference.networking.k8s.io"]
+    resources: ["inferencepools"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["inference.networking.x-k8s.io"]
+    resources: ["inferenceobjectives", "inferencemodelrewrites"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get", "list", "create", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "list", "create", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
