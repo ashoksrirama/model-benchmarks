@@ -19,8 +19,11 @@ func TestRenderLLMDDisaggregated_StreamerMemoryLimit(t *testing.T) {
 		t.Error("no memory-limit env expected when StreamerMemoryLimitGiB == 0")
 	}
 
-	// Set → env present in bytes (16 GiB = 17179869184).
+	// Set (with the streamer on) → env present in bytes (16 GiB = 17179869184).
+	// The whole streamer-env block is gated on UseRunaiStreamer, mirroring the
+	// single-node template — memory-limit only matters for a streamed load.
 	p := sampleDisaggParams()
+	p.UseRunaiStreamer = true
 	p.StreamerMemoryLimitGiB = 16
 	out, err = RenderLLMDDisaggregated(p)
 	if err != nil {
@@ -31,6 +34,52 @@ func TestRenderLLMDDisaggregated_StreamerMemoryLimit(t *testing.T) {
 	}
 	if !strings.Contains(out, "17179869184") {
 		t.Errorf("memory-limit should render as bytes (16 GiB = 17179869184)")
+	}
+}
+
+// TestRenderLLMDDisaggregated_StreamerChunk (bandwidth-aware profile): the
+// RUNAI_STREAMER_CHUNK_BYTESIZE env is emitted only when StreamerChunkBytesize is
+// set (high-bandwidth instances), and the S3 retry envs ride along with any
+// streamed load. An HF-only run (UseRunaiStreamer false) emits none of them.
+func TestRenderLLMDDisaggregated_StreamerChunk(t *testing.T) {
+	// Streamed + high-BW chunk set.
+	p := sampleDisaggParams()
+	p.UseRunaiStreamer = true
+	p.StreamerChunkBytesize = "4294967296"
+	out, err := RenderLLMDDisaggregated(p)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	for _, want := range []string{
+		"RUNAI_STREAMER_CHUNK_BYTESIZE", "4294967296",
+		"RUNAI_STREAMER_S3_REQUEST_TIMEOUT_MS", "RUNAI_STREAMER_S3_LOW_SPEED_LIMIT",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("streamed high-BW D/P render missing %q", want)
+		}
+	}
+
+	// Streamed but standard instance (no chunk) → retry envs present, chunk absent.
+	p2 := sampleDisaggParams()
+	p2.UseRunaiStreamer = true
+	out2, err := RenderLLMDDisaggregated(p2)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if strings.Contains(out2, "RUNAI_STREAMER_CHUNK_BYTESIZE") {
+		t.Error("standard-BW streamed run must NOT set the chunk env (inherits 8 MiB default)")
+	}
+	if !strings.Contains(out2, "RUNAI_STREAMER_S3_REQUEST_TIMEOUT_MS") {
+		t.Error("streamed run must set the S3 retry envs regardless of bandwidth")
+	}
+
+	// HF-only (streamer off) → none of the streamer envs.
+	out3, err := RenderLLMDDisaggregated(sampleDisaggParams())
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if strings.Contains(out3, "RUNAI_STREAMER_S3_REQUEST_TIMEOUT_MS") || strings.Contains(out3, "RUNAI_STREAMER_CHUNK_BYTESIZE") {
+		t.Error("HF-only run must emit no streamer tuning envs")
 	}
 }
 

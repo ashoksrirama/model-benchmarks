@@ -57,9 +57,24 @@ spec:
             - name: NCCL_P2P_LEVEL
               value: "NVL"
 {{- end }}
-{{- if and .UseRunaiStreamer (gt .StreamerMemoryLimitGiB 0) }}
+{{- if .UseRunaiStreamer }}
+            # Run:ai streamer S3 retry tuning (both real in the streamer C++
+            # source, undocumented in its markdown; defaults 1000ms / disabled).
+            # Abort+retry a request that stalls below the low-speed floor.
+            - name: RUNAI_STREAMER_S3_REQUEST_TIMEOUT_MS
+              value: "3000"
+            - name: RUNAI_STREAMER_S3_LOW_SPEED_LIMIT
+              value: "1048576"
+{{- if .StreamerChunkBytesize }}
+            # High-bandwidth instance: AWS's 4 GiB chunk. Standard instances omit
+            # this and inherit the streamer's 8 MiB object-storage default.
+            - name: RUNAI_STREAMER_CHUNK_BYTESIZE
+              value: "{{ .StreamerChunkBytesize }}"
+{{- end }}
+{{- if gt .StreamerMemoryLimitGiB 0 }}
             - name: RUNAI_STREAMER_MEMORY_LIMIT
               value: "{{ gibBytes .StreamerMemoryLimitGiB }}"
+{{- end }}
 {{- end }}
 {{- if .RuntimeCommand }}
           command: {{ toYAMLStringList .RuntimeCommand }}
@@ -98,9 +113,23 @@ spec:
             - name: NCCL_P2P_LEVEL
               value: "NVL"
 {{- end }}
-{{- if and .UseRunaiStreamer (gt .StreamerMemoryLimitGiB 0) }}
+{{- if .UseRunaiStreamer }}
+            # Run:ai streamer S3 retry tuning (both real in the streamer C++
+            # source, undocumented in its markdown; defaults 1000ms / disabled).
+            - name: RUNAI_STREAMER_S3_REQUEST_TIMEOUT_MS
+              value: "3000"
+            - name: RUNAI_STREAMER_S3_LOW_SPEED_LIMIT
+              value: "1048576"
+{{- if .StreamerChunkBytesize }}
+            # High-bandwidth instance: AWS's 4 GiB chunk. Standard instances omit
+            # this and inherit the streamer's 8 MiB object-storage default.
+            - name: RUNAI_STREAMER_CHUNK_BYTESIZE
+              value: "{{ .StreamerChunkBytesize }}"
+{{- end }}
+{{- if gt .StreamerMemoryLimitGiB 0 }}
             - name: RUNAI_STREAMER_MEMORY_LIMIT
               value: "{{ gibBytes .StreamerMemoryLimitGiB }}"
+{{- end }}
 {{- end }}
 {{- if eq .Framework "sglang" }}
           command: ["python3"]
@@ -119,7 +148,7 @@ spec:
             - "--load-format"
             - "runai_streamer"
             - "--model-loader-extra-config"
-            - '{"distributed":true,"concurrency":{{ if gt .StreamerConcurrency 0 }}{{ .StreamerConcurrency }}{{ else }}16{{ end }}{{ if gt .StreamerMemoryLimitGiB 0 }},"memory_limit":{{ gibBytes .StreamerMemoryLimitGiB }}{{ end }}}'
+            - '{"concurrency":{{ if gt .StreamerConcurrency 0 }}{{ .StreamerConcurrency }}{{ else }}32{{ end }}{{ if gt .TensorParallelDegree 1 }},"distributed":true{{ end }}{{ if gt .StreamerMemoryLimitGiB 0 }},"memory_limit":{{ gibBytes .StreamerMemoryLimitGiB }}{{ end }}}'
 {{- else }}
             - "{{ .ModelHfID }}"
 {{- end }}
@@ -156,7 +185,9 @@ spec:
             - "--load-format"
             - "runai_streamer"
             - "--model-loader-extra-config"
-            - '{"concurrency":{{ if gt .StreamerConcurrency 0 }}{{ .StreamerConcurrency }}{{ else }}16{{ end }}}'
+            {{- /* concurrency: operator value or the S3-benchmarked default (32);
+                   distributed:true only for TP>1 (each rank streams its own shard). */}}
+            - '{"concurrency":{{ if gt .StreamerConcurrency 0 }}{{ .StreamerConcurrency }}{{ else }}32{{ end }}{{ if gt .TensorParallelDegree 1 }},"distributed":true{{ end }}}'
 {{- else }}
             - "--model"
             - "{{ .ModelHfID }}"

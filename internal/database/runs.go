@@ -184,6 +184,11 @@ type RunExportDetails struct {
 	// don't set them.
 	LLMDVersion   string
 	PDVLLMVersion string
+	// ModelSizeBytes is the cached model's size, injected by the export handler
+	// (resolveExportStreamer) to derive the Run:ai streamer concurrency exactly
+	// as the orchestrator does (size-derived on high-bandwidth instances).
+	// 0 = unknown → the profile default concurrency.
+	ModelSizeBytes int64
 }
 
 // GetRunExportDetails returns the information needed to export a run's

@@ -107,7 +107,12 @@ type ModelDeploymentParams struct {
 	ModelS3URI           string // s3://bucket/models/org/model (empty = use HF)
 	UseRunaiStreamer      bool   // true = --load-format runai_streamer
 	ModelServiceAccount   string // K8s service account for S3 access
-	StreamerConcurrency   int    // runai_streamer concurrency (default 16)
+	StreamerConcurrency   int    // runai_streamer concurrency (profile default 32)
+	// StreamerChunkBytesize is the RUNAI_STREAMER_CHUNK_BYTESIZE env value
+	// (bytes, as a string). Set to AWS's 4 GiB on high-bandwidth instances;
+	// empty ⇒ emit no env var, inheriting the streamer's 8 MiB object-storage
+	// default. Resolved by runtime.StreamerChunkBytesize.
+	StreamerChunkBytesize string
 	PullThroughRegistry   string // ECR pull-through cache host (empty = direct Docker Hub)
 	// PRD-49: full vLLM image URI override. When non-empty, used verbatim
 	// as the model container image and the PullThroughRegistry +
@@ -273,12 +278,22 @@ type LLMDDisaggregatedParams struct {
 	ModelLabel    string
 	HfToken       string
 	ModelServiceAccount string
+	// UseRunaiStreamer gates the Run:ai streamer tuning env block (S3 retry
+	// timeout/low-speed, chunk bytesize, memory limit) on every model container
+	// — true when the run streams weights from S3 (ServeArgs carry
+	// --load-format runai_streamer).
+	UseRunaiStreamer bool
 	// PRD-65 Layer 3: RUNAI_STREAMER_MEMORY_LIMIT env (GiB) on every model
 	// container when > 0. Caps the streamer's shared CPU buffer during weight
 	// load, mirroring the single-node model-deployment template. 0 ⇒ emit no
 	// env var (inherit the upstream default). Only meaningful when the run
 	// streams from S3 (ServeArgs carry --load-format runai_streamer).
 	StreamerMemoryLimitGiB int
+	// StreamerChunkBytesize is the RUNAI_STREAMER_CHUNK_BYTESIZE env value
+	// (bytes, string). AWS's 4 GiB on high-bandwidth instances; empty ⇒ no env
+	// var (streamer's 8 MiB object-storage default). Only meaningful for a
+	// streamed load. Resolved by runtime.StreamerChunkBytesize.
+	StreamerChunkBytesize string
 	// InstanceTypeName adds a node.kubernetes.io/instance-type nodeSelector to
 	// every serving pod. NOTE: a STATIC NodePool provisions from its OWN template
 	// requirements, ignoring pods (Karpenter docs), so this selector does NOT

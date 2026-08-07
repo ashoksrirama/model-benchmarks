@@ -21,9 +21,9 @@ func TestResolveS3Model(t *testing.T) {
 			ModelHfID:  "org/model",
 			ModelS3URI: "s3://bucket/explicit",
 		}}
-		uri, useRunai := o.resolveS3Model(context.Background(), cfg)
-		if uri != "s3://bucket/explicit" || !useRunai {
-			t.Errorf("explicit URI: got (%q, %v), want (s3://bucket/explicit, true)", uri, useRunai)
+		sm := o.resolveS3Model(context.Background(), cfg)
+		if sm.URI != "s3://bucket/explicit" || !sm.UseRunai {
+			t.Errorf("explicit URI: got %+v, want {s3://bucket/explicit true}", sm)
 		}
 	})
 
@@ -37,9 +37,9 @@ func TestResolveS3Model(t *testing.T) {
 		cfg := RunConfig{RunID: "run12345", Request: &database.RunRequest{
 			ModelHfID: "org/model", // no explicit URI, no revision → defaults to "main"
 		}}
-		uri, useRunai := o.resolveS3Model(context.Background(), cfg)
-		if uri != "s3://bucket/cached" || !useRunai {
-			t.Errorf("cached: got (%q, %v), want (s3://bucket/cached, true)", uri, useRunai)
+		sm := o.resolveS3Model(context.Background(), cfg)
+		if sm.URI != "s3://bucket/cached" || !sm.UseRunai {
+			t.Errorf("cached: got %+v, want URI=s3://bucket/cached useRunai=true", sm)
 		}
 	})
 
@@ -48,9 +48,9 @@ func TestResolveS3Model(t *testing.T) {
 		cfg := RunConfig{RunID: "run12345", Request: &database.RunRequest{
 			ModelHfID: "org/not-cached",
 		}}
-		uri, useRunai := o.resolveS3Model(context.Background(), cfg)
-		if uri != "" || useRunai {
-			t.Errorf("uncached: got (%q, %v), want (\"\", false)", uri, useRunai)
+		sm := o.resolveS3Model(context.Background(), cfg)
+		if sm.URI != "" || sm.UseRunai {
+			t.Errorf("uncached: got %+v, want {\"\" false}", sm)
 		}
 	})
 
@@ -64,9 +64,9 @@ func TestResolveS3Model(t *testing.T) {
 		cfg := RunConfig{RunID: "run12345", Request: &database.RunRequest{
 			ModelHfID: "org/model",
 		}}
-		uri, useRunai := o.resolveS3Model(context.Background(), cfg)
-		if uri != "" || useRunai {
-			t.Errorf("non-cached status: got (%q, %v), want (\"\", false)", uri, useRunai)
+		sm := o.resolveS3Model(context.Background(), cfg)
+		if sm.URI != "" || sm.UseRunai {
+			t.Errorf("non-cached status: got %+v, want {\"\" false}", sm)
 		}
 	})
 }

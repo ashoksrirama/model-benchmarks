@@ -123,9 +123,10 @@ func TestLLMD_BuildArgs_S3Streamer(t *testing.T) {
 	if !strings.Contains(joined, "s3://bucket/model") {
 		t.Errorf("expected S3 URI as model; got: %s", joined)
 	}
-	// No memory-limit set → extra-config is concurrency-only (default 16).
-	if !strings.Contains(joined, `{"concurrency":16}`) {
-		t.Errorf("expected concurrency-only extra-config; got: %s", joined)
+	// TP=4 (>1) → distributed:true; no explicit/memory-limit → default S3
+	// concurrency 32 (run.ai benchmark optimum).
+	if !strings.Contains(joined, `{"concurrency":32,"distributed":true}`) {
+		t.Errorf("expected concurrency+distributed extra-config for TP>1; got: %s", joined)
 	}
 }
 
@@ -147,15 +148,33 @@ func TestLLMD_BuildArgs_StreamerMemoryLimit(t *testing.T) {
 	}
 }
 
-// TestStreamerExtraConfig covers the shared JSON builder directly.
+// TestStreamerExtraConfig covers the shared JSON builder directly. Concurrency is
+// bandwidth-aware: on a standard instance it's the S3-benchmarked default (32) or
+// an explicit override; on a high-bandwidth instance (>=50 Gbps) with a known
+// model size it's AWS's ceil(size_gb/4gb). distributed only for TP>1; memory_limit
+// when set.
 func TestStreamerExtraConfig(t *testing.T) {
-	if got := streamerExtraConfig(ContainerParams{}); got != `{"concurrency":16}` {
-		t.Errorf("default = %q", got)
+	gib := int64(1024 * 1024 * 1024)
+	cases := []struct {
+		name string
+		p    ContainerParams
+		want string
+	}{
+		{"standard default (TP=1)", ContainerParams{InstanceTypeName: "g6.2xlarge"}, `{"concurrency":32}`},
+		{"explicit concurrency wins", ContainerParams{StreamerConcurrency: 4, InstanceTypeName: "g6.2xlarge"}, `{"concurrency":4}`},
+		{"TP>1 adds distributed", ContainerParams{TensorParallelDegree: 2, InstanceTypeName: "g6.2xlarge"}, `{"concurrency":32,"distributed":true}`},
+		{"TP=1 no distributed", ContainerParams{TensorParallelDegree: 1, InstanceTypeName: "g6.2xlarge"}, `{"concurrency":32}`},
+		{"standard ignores size (no AWS formula on low-BW)", ContainerParams{ModelSizeBytes: 67 * gib, InstanceTypeName: "g6.2xlarge"}, `{"concurrency":32}`},
+		{"high-BW size-derived (67GiB → ceil(67/4)=17)", ContainerParams{ModelSizeBytes: 67 * gib, InstanceTypeName: "p5.48xlarge"}, `{"concurrency":17}`},
+		{"high-BW size cap at 64 (400GiB)", ContainerParams{ModelSizeBytes: 400 * gib, InstanceTypeName: "g6e.12xlarge"}, `{"concurrency":64}`},
+		{"high-BW explicit beats size", ContainerParams{StreamerConcurrency: 8, ModelSizeBytes: 67 * gib, InstanceTypeName: "p5.48xlarge"}, `{"concurrency":8}`},
+		{"high-BW no size → default 32", ContainerParams{InstanceTypeName: "p5.48xlarge"}, `{"concurrency":32}`},
+		{"high-BW all: size + TP>1 + memlimit", ContainerParams{ModelSizeBytes: 10 * gib, TensorParallelDegree: 2, StreamerMemoryLimitGiB: 1, InstanceTypeName: "p5.48xlarge"},
+			`{"concurrency":3,"distributed":true,"memory_limit":1073741824}`},
 	}
-	if got := streamerExtraConfig(ContainerParams{StreamerConcurrency: 4}); got != `{"concurrency":4}` {
-		t.Errorf("concurrency-only = %q", got)
-	}
-	if got := streamerExtraConfig(ContainerParams{StreamerMemoryLimitGiB: 1}); got != `{"concurrency":16,"memory_limit":1073741824}` {
-		t.Errorf("with memory_limit = %q", got)
+	for _, c := range cases {
+		if got := streamerExtraConfig(c.p); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
 	}
 }

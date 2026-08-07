@@ -108,32 +108,32 @@ func sanitizeDNS1123(modelID string) string {
 // llm-d render paths append coordination/TP flags onto — mirroring the llm-d
 // runtime's BuildArgs (model id + --trust-remote-code + optional knobs). Uses the
 // run's shared --max-num-batched-tokens.
-func exportServeArgs(d *database.RunExportDetails) []string {
-	return exportServeArgsWithBatchTokens(d, d.MaxNumBatchedTokens)
+func exportServeArgs(d *database.RunExportDetails, tp int) []string {
+	return exportServeArgsWithBatchTokens(d, d.MaxNumBatchedTokens, tp)
 }
 
 // exportServeArgsWithBatchTokens is exportServeArgs with an explicit
 // --max-num-batched-tokens override — used to build the PRD-64 per-role arg sets
 // so the exported prefill/decode/both Deployments carry the exact per-role
 // scheduler flag that was applied. maxNBT nil/<=0 ⇒ omit the flag (vLLM default).
-func exportServeArgsWithBatchTokens(d *database.RunExportDetails, maxNBT *int) []string {
+func exportServeArgsWithBatchTokens(d *database.RunExportDetails, maxNBT *int, tp int) []string {
 	// PRD-65 Layer 4: when the run streamed from S3 (Run:ai), the model arg is
-	// the S3 URI + --load-format runai_streamer + --model-loader-extra-config
-	// (concurrency, and memory_limit in bytes when set) — mirroring the runtime
-	// BuildArgs so the exported manifest reproduces the deployed serve line.
-	// Otherwise the HF model id (unchanged). resolveExportStreamer scopes
-	// UseRunaiStreamer to D/P, so PP never takes this branch.
+	// the S3 URI + --load-format runai_streamer + --model-loader-extra-config.
+	// The extra-config JSON is built by the SAME runtime.StreamerExtraConfig the
+	// orchestrator's BuildArgs uses (concurrency, distributed for TP>1,
+	// memory_limit) so the export can't drift from what deployed. Otherwise the
+	// HF model id (unchanged). resolveExportStreamer scopes UseRunaiStreamer to
+	// D/P, so PP never takes this branch.
 	var args []string
 	if d.UseRunaiStreamer && d.ModelS3URI != nil && *d.ModelS3URI != "" {
-		concurrency := 16
-		if d.StreamerConcurrency != nil && *d.StreamerConcurrency > 0 {
-			concurrency = *d.StreamerConcurrency
-		}
-		extra := fmt.Sprintf(`{"concurrency":%d}`, concurrency)
-		if memGiB := exportStreamerMemLimitGiB(d); memGiB > 0 {
-			extra = fmt.Sprintf(`{"concurrency":%d,"memory_limit":%d}`,
-				concurrency, int64(memGiB)*1024*1024*1024)
-		}
+		extra := runtime.StreamerExtraConfig(runtime.ContainerParams{
+			UseRunaiStreamer:       true,
+			TensorParallelDegree:   tp,
+			StreamerConcurrency:    derefIntExport(d.StreamerConcurrency),
+			StreamerMemoryLimitGiB: exportStreamerMemLimitGiB(d),
+			ModelSizeBytes:         d.ModelSizeBytes,
+			InstanceTypeName:       d.InstanceTypeName,
+		})
 		args = []string{*d.ModelS3URI, "--load-format", "runai_streamer", "--model-loader-extra-config", extra, "--trust-remote-code"}
 	} else {
 		args = []string{d.ModelHfID, "--trust-remote-code"}
@@ -169,6 +169,16 @@ func exportPDStreamerMemLimitGiB(d *database.RunExportDetails) int {
 		return exportStreamerMemLimitGiB(d)
 	}
 	return 0
+}
+
+// exportPDStreamerChunkBytesize is the render-param form: AWS's 4 GiB chunk env
+// only when the run streamed on a high-bandwidth instance (matching the
+// orchestrator), else "" → the template emits no env (8 MiB streamer default).
+func exportPDStreamerChunkBytesize(d *database.RunExportDetails) string {
+	if d.UseRunaiStreamer && d.ModelS3URI != nil && *d.ModelS3URI != "" {
+		return runtime.StreamerChunkBytesize(d.InstanceTypeName)
+	}
+	return ""
 }
 
 // exportPDModelServiceAccount returns the S3-access service account for a
@@ -246,7 +256,7 @@ func generateDistributedManifest(d *database.RunExportDetails) (string, error) {
 		Name:                   name,
 		Namespace:              "accelbench",
 		Image:                  exportLLMDImageFor(d),
-		ServeArgs:              exportServeArgs(d),
+		ServeArgs:              exportServeArgs(d, d.TensorParallelDegree),
 		ContainerName:          "vllm",
 		ModelHfID:              d.ModelHfID,
 		HfToken:                "",
@@ -302,15 +312,23 @@ func generateDisaggregatedManifest(d *database.RunExportDetails) (string, error)
 	// arg set is emitted only when that role had an override (matching the
 	// orchestrator, which leaves the per-role sets nil otherwise → template falls
 	// back to shared).
+	prefillTP := deref(d.PrefillTP, 1)
+	decodeTP := deref(d.DecodeTP, 1)
+	bothTP := deref(d.BothTP, 1)
+	// Per-role arg sets: built when a role has a batch-token override OR when
+	// streaming (so each role's distributed:true reflects its own TP), mirroring
+	// deployLLMDDisaggregated. When neither applies the set stays nil and the
+	// template falls back to the shared ServeArgs (byte-identical to pre-PRD-65).
+	streamed := d.UseRunaiStreamer && d.ModelS3URI != nil && *d.ModelS3URI != ""
 	var prefillArgs, decodeArgs, bothArgs []string
-	if d.PrefillMaxNumBatchedTokens != nil && *d.PrefillMaxNumBatchedTokens > 0 {
-		prefillArgs = exportServeArgsWithBatchTokens(d, d.PrefillMaxNumBatchedTokens)
+	if (d.PrefillMaxNumBatchedTokens != nil && *d.PrefillMaxNumBatchedTokens > 0) || streamed {
+		prefillArgs = exportServeArgsWithBatchTokens(d, d.PrefillMaxNumBatchedTokens, prefillTP)
 	}
-	if d.DecodeMaxNumBatchedTokens != nil && *d.DecodeMaxNumBatchedTokens > 0 {
-		decodeArgs = exportServeArgsWithBatchTokens(d, d.DecodeMaxNumBatchedTokens)
+	if (d.DecodeMaxNumBatchedTokens != nil && *d.DecodeMaxNumBatchedTokens > 0) || streamed {
+		decodeArgs = exportServeArgsWithBatchTokens(d, d.DecodeMaxNumBatchedTokens, decodeTP)
 	}
-	if d.BothMaxNumBatchedTokens != nil && *d.BothMaxNumBatchedTokens > 0 {
-		bothArgs = exportServeArgsWithBatchTokens(d, d.BothMaxNumBatchedTokens)
+	if ((d.BothMaxNumBatchedTokens != nil && *d.BothMaxNumBatchedTokens > 0) || streamed) && bothR > 0 {
+		bothArgs = exportServeArgsWithBatchTokens(d, d.BothMaxNumBatchedTokens, bothTP)
 	}
 	// Resolve the D/P vLLM image the same way the orchestrator's deploy path
 	// does (PRD-66 Part 2): a VLLM_IMAGE / PD_MODEL_IMAGE override wins verbatim;
@@ -326,7 +344,7 @@ func generateDisaggregatedManifest(d *database.RunExportDetails) (string, error)
 		Name:                name,
 		Namespace:           "accelbench",
 		Image:               pdImage,
-		ServeArgs:           exportServeArgs(d),
+		ServeArgs:           exportServeArgs(d, prefillTP),
 		PrefillServeArgs:    prefillArgs,
 		DecodeServeArgs:     decodeArgs,
 		BothServeArgs:       bothArgs,
@@ -335,9 +353,12 @@ func generateDisaggregatedManifest(d *database.RunExportDetails) (string, error)
 		ModelLabel:          sanitizeDNS1123(d.ModelHfID),
 		HfToken:             "",
 		// PRD-65 Layer 4: reproduce the streamed-load wiring — the S3-access SA
-		// + the memory-limit env — when the run streamed (D/P cached model).
+		// + the streamer tuning env (retry / chunk / memory-limit) — when the run
+		// streamed (D/P cached model).
 		ModelServiceAccount:    exportPDModelServiceAccount(d),
+		UseRunaiStreamer:       d.UseRunaiStreamer && d.ModelS3URI != nil && *d.ModelS3URI != "",
 		StreamerMemoryLimitGiB: exportPDStreamerMemLimitGiB(d),
+		StreamerChunkBytesize:  exportPDStreamerChunkBytesize(d),
 		InstanceTypeName:    d.InstanceTypeName,
 		PrefillReplicas:     prefillR,
 		PrefillTP:           deref(d.PrefillTP, 1),
@@ -448,6 +469,9 @@ func (s *Server) resolveExportStreamer(ctx context.Context, d *database.RunExpor
 		uri := cached.S3URI
 		d.ModelS3URI = &uri
 		d.UseRunaiStreamer = true
+		if cached.SizeBytes != nil {
+			d.ModelSizeBytes = *cached.SizeBytes // matches the orchestrator's size-derived concurrency
+		}
 	}
 }
 
@@ -516,8 +540,9 @@ type manifestData struct {
 	// ModelS3URI is set — matching what streamer_mode=off produced at
 	// runtime.
 	UseRunaiStreamer       bool
-	StreamerConcurrency    int   // 0 → template default of 16
-	StreamerMemoryLimitGiB int   // 0 → emit no env var, inherit upstream 40 GB default
+	StreamerConcurrency    int    // bandwidth-aware; profile default 32
+	StreamerChunkBytesize  string // RUNAI_STREAMER_CHUNK_BYTESIZE (bytes); "" ⇒ omit env (8 MiB default)
+	StreamerMemoryLimitGiB int    // 0 → emit no env var, inherit upstream 40 GB default
 	StreamerMemoryLimitBytes int64 // derived for the env-var value
 }
 
@@ -581,12 +606,13 @@ func generateManifest(d *database.RunExportDetails) (string, error) {
 		data.Quantization = *d.Quantization
 	}
 
-	// PRD-50: streamer knobs. Concurrency defaults to 16 when null.
-	// Memory limit is rendered as bytes in the env var.
-	if d.StreamerConcurrency != nil && *d.StreamerConcurrency > 0 {
-		data.StreamerConcurrency = *d.StreamerConcurrency
-	} else {
-		data.StreamerConcurrency = 16
+	// PRD-50: streamer knobs, resolved through the SAME runtime helpers the
+	// orchestrator uses so the export reproduces what deployed — bandwidth-aware
+	// concurrency (explicit / AWS size-derived on high-BW instances / default 32)
+	// and the matching 4 GiB chunk env on high-BW instances. Memory limit as bytes.
+	data.StreamerConcurrency = runtime.StreamerConcurrency(derefIntExport(d.StreamerConcurrency), d.ModelSizeBytes, d.InstanceTypeName)
+	if data.UseRunaiStreamer {
+		data.StreamerChunkBytesize = runtime.StreamerChunkBytesize(d.InstanceTypeName)
 	}
 	if d.StreamerMemoryLimitGiB != nil && *d.StreamerMemoryLimitGiB > 0 {
 		data.StreamerMemoryLimitGiB = *d.StreamerMemoryLimitGiB
@@ -756,10 +782,22 @@ spec:
             - name: NCCL_P2P_LEVEL
               value: "NVL"
 {{- end }}
-{{- if and .UseRunaiStreamer (gt .StreamerMemoryLimitBytes 0) }}
+{{- if .UseRunaiStreamer }}
+            # Run:ai streamer S3 retry tuning (real in the streamer C++ source).
+            - name: RUNAI_STREAMER_S3_REQUEST_TIMEOUT_MS
+              value: "3000"
+            - name: RUNAI_STREAMER_S3_LOW_SPEED_LIMIT
+              value: "1048576"
+{{- if .StreamerChunkBytesize }}
+            # High-bandwidth instance: AWS's 4 GiB chunk (else 8 MiB default).
+            - name: RUNAI_STREAMER_CHUNK_BYTESIZE
+              value: "{{ .StreamerChunkBytesize }}"
+{{- end }}
+{{- if gt .StreamerMemoryLimitBytes 0 }}
             # PRD-50: cap the Run:ai streamer's shared CPU buffer.
             - name: RUNAI_STREAMER_MEMORY_LIMIT
               value: "{{ .StreamerMemoryLimitBytes }}"
+{{- end }}
 {{- end }}
 {{- if eq .Framework "sglang" }}
           command:
@@ -778,7 +816,7 @@ spec:
             - "--load-format"
             - "runai_streamer"
             - "--model-loader-extra-config"
-            - '{"concurrency":{{ .StreamerConcurrency }}}'
+            - '{"concurrency":{{ .StreamerConcurrency }}{{ if gt .TensorParallelDegree 1 }},"distributed":true{{ end }}}'
 {{- else if .ModelS3URI }}
             # Streamer disabled (streamer_mode=off on the original run).
             - "--model"

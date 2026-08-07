@@ -181,9 +181,9 @@ func TestGenerateManifest_Disaggregated_Streamer(t *testing.T) {
 		return &database.RunExportDetails{
 			ModelHfID: "Qwen/Qwen2.5-1.5B-Instruct", InstanceTypeName: "g6.2xlarge",
 			Framework: "llm-d", FrameworkVersion: "v0.8.1",
-			TensorParallelDegree: 1, AcceleratorCount: 1, VCPUs: 8, MemoryGiB: 32,
+			TensorParallelDegree: 2, AcceleratorCount: 4, VCPUs: 48, MemoryGiB: 192,
 			DeploymentMode: strptr("disaggregated"), NodeCount: intptr(2), NetworkMode: strptr("tcp"),
-			PrefillReplicas: intptr(1), PrefillTP: intptr(1), DecodeReplicas: intptr(1), DecodeTP: intptr(1),
+			PrefillReplicas: intptr(1), PrefillTP: intptr(2), DecodeReplicas: intptr(1), DecodeTP: intptr(2),
 		}
 	}
 	// Streamed: UseRunaiStreamer + S3 URI (as resolveExportStreamer would set).
@@ -195,17 +195,26 @@ func TestGenerateManifest_Disaggregated_Streamer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generateManifest: %v", err)
 	}
+	// g6.2xlarge is a standard-bandwidth instance (5 Gbps), so the export uses the
+	// run.ai profile: flat concurrency 32, S3 retry envs, and NO 4 GiB chunk env
+	// (inherits the streamer's 8 MiB object-storage default).
 	for _, want := range []string{
 		"runai_streamer",
 		"s3://accelbench-models/qwen",
-		"memory_limit",                // extra-config carries it
-		"RUNAI_STREAMER_MEMORY_LIMIT", // env on the container
-		"17179869184",                 // 32 GiB node / 2 = 16 GiB → bytes
-		"accelbench-model",            // S3-access service account
+		"distributed",                          // TP=2 → each rank streams its own shard
+		`"concurrency":32`,                     // standard-BW → benchmarked default
+		"memory_limit",                         // extra-config carries it
+		"RUNAI_STREAMER_MEMORY_LIMIT",          // env on the container
+		"RUNAI_STREAMER_S3_REQUEST_TIMEOUT_MS", // S3 retry envs on any streamed load
+		"103079215104",                         // memory-limit: 192 GiB node / 2 = 96 GiB in bytes
+		"accelbench-model",                     // S3-access service account
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("streamed D/P export missing %q", want)
 		}
+	}
+	if strings.Contains(out, "RUNAI_STREAMER_CHUNK_BYTESIZE") {
+		t.Error("standard-BW instance export must NOT set the 4 GiB chunk env")
 	}
 
 	// HF-only (no streamer): none of the streamer flags/env appear.
