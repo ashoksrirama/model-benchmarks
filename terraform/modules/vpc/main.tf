@@ -40,3 +40,20 @@ module "vpc" {
 
   tags = var.tags
 }
+
+# S3 Gateway VPC endpoint. Model weights (Run:ai streamer) and the ECR
+# pull-through cache's S3-backed image layers are pulled from S3 on every
+# benchmark run; a fresh GPU node per run means these pulls happen constantly.
+# Without this endpoint that traffic egresses through the NAT gateway — a shared
+# bandwidth ceiling + per-GB data-processing charge, and a bottleneck when
+# several nodes pull at once (AWS's fast-model-loading guidance flags this).
+# A Gateway endpoint keeps S3 traffic on the AWS network (no NAT, no per-GB fee)
+# by injecting the S3 prefix-list route into the private route tables. Gateway
+# endpoints are free. Greenfield only (this module isn't created in brownfield).
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = module.vpc.vpc_id
+  service_name      = "com.amazonaws.${var.region}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = module.vpc.private_route_table_ids
+  tags              = merge(var.tags, { Name = "${var.name}-s3" })
+}

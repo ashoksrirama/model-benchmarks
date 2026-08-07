@@ -217,6 +217,7 @@ module "vpc" {
   name         = "${var.project_name}-vpc"
   cidr         = var.vpc_cidr
   cluster_name = local.cluster_name
+  region       = var.region
 
   tags = local.tags
 }
