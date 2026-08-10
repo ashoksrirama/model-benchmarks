@@ -18,70 +18,25 @@ data "aws_ssm_parameter" "gpu_ami" {
 # PRD-65: SOCI PARALLEL-PULL mode, shared by the single-node gpu class AND the
 # multi-node classes (defined once, can't drift). Speeds large-image pulls (the
 # 8.9 GB llm-d-aws PP image took ~4m6s pre-SOCI); all GPU classes share the
-# accelerated AL2023 AMI, which SHIPS the soci-snapshotter binary + service.
+# accelerated AL2023 AMI, which ships containerd 2.2 + the soci-snapshotter.
 #
-# The prior version only sed'd tuning knobs into config.toml — a NO-OP, verified
-# live: the snapshotter wasn't running, containerd wasn't wired to it, and the
-# master enable flag was never set (default false = lazy loading, which we do NOT
-# want). This version does the three things AWS's docs require to actually turn on
-# PARALLEL-PULL (awslabs/soci-snapshotter docs/parallel-mode.md + the EKS +
-# DLAMI blogs):
-#   1. write /etc/soci-snapshotter-grpc/config.toml with
-#      [pull_modes.parallel_pull_unpack] enable = true + AWS's ECR-recommended
-#      tuning (containerd content store);
-#   2. wire containerd to use soci as the CRI snapshotter via a drop-in
-#      (proxy_plugins.soci socket + snapshotter = "soci");
-#   3. enable+restart soci-snapshotter then restart containerd, so the running
-#      kubelet/containerd use SOCI for subsequent image pulls.
-# Runs as a cloud-init shellscript MIME part (AL2023). Injected as a jsonencode()'d
-# scalar on each EC2NodeClass userData (valid YAML, avoids block-scalar pitfalls).
+# Enablement is the nodeadm `FastImagePull` feature gate — the clean, AWS-blessed
+# AL2023 path (per the Aug-2026 EKS "pulling multi-gigabyte images in seconds"
+# post + the nodeadm API: `Feature` enum includes `FastImagePull`). The gate
+# switches image pulls to SOCI's parallel-pull-unpack mode with AWS's tuned
+# defaults — replacing the previous hand-rolled config.toml + proxy_plugins
+# drop-in + systemctl dance (fragile: its FIRST incarnation was a silent no-op).
+# nodeadm owns wiring the snapshotter + containerd, so we just flip the gate.
+#
+# Injected as a jsonencode()'d NodeConfig on each EC2NodeClass userData; nodeadm
+# MERGES it with the EKS bootstrap NodeConfig (multiple NodeConfig docs compose).
 locals {
   soci_user_data = <<-EOT
-    MIME-Version: 1.0
-    Content-Type: multipart/mixed; boundary="BOUNDARY"
-
-    --BOUNDARY
-    Content-Type: text/x-shellscript; charset="us-ascii"
-
-    #!/bin/bash
-    set -euo pipefail
-
-    # 1. SOCI parallel-pull config (enable flag is the master switch; default is
-    #    false = lazy loading). Tuning = AWS's recommended ECR defaults.
-    mkdir -p /etc/soci-snapshotter-grpc
-    cat > /etc/soci-snapshotter-grpc/config.toml <<'SOCI'
-    [content_store]
-    type = "containerd"
-
-    [pull_modes.parallel_pull_unpack]
-    enable = true
-    max_concurrent_downloads = -1
-    max_concurrent_downloads_per_image = 20
-    concurrent_download_chunk_size = "16mb"
-    max_concurrent_unpacks = -1
-    max_concurrent_unpacks_per_image = 10
-    discard_unpacked_layers = true
-    SOCI
-
-    # 2. Wire containerd to use the soci snapshotter for CRI (drop-in merged by
-    #    nodeadm/containerd). proxy_plugins.soci points at the grpc socket.
-    mkdir -p /etc/containerd/config.d
-    cat > /etc/containerd/config.d/soci.toml <<'CTRD'
-    version = 2
-    [proxy_plugins.soci]
-    type = "snapshot"
-    address = "/run/soci-snapshotter-grpc/soci-snapshotter-grpc.sock"
-    [plugins."io.containerd.grpc.v1.cri".containerd]
-    snapshotter = "soci"
-    disable_snapshot_annotations = false
-    CTRD
-
-    # 3. Start SOCI, then restart containerd so it picks up the drop-in. The EKS
-    #    AL2023 AMI ships the soci-snapshotter service; enable+start it first.
-    systemctl enable --now soci-snapshotter 2>/dev/null || systemctl enable --now soci-snapshotter-grpc 2>/dev/null || true
-    systemctl restart containerd || true
-
-    --BOUNDARY--
+    apiVersion: node.eks.aws/v1alpha1
+    kind: NodeConfig
+    spec:
+      featureGates:
+        FastImagePull: true
   EOT
 }
 
