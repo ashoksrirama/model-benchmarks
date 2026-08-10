@@ -575,10 +575,19 @@ func (o *Orchestrator) Execute(ctx context.Context, cfg RunConfig) error {
 // Returns (s3URI, useRunai). Path-agnostic so single-node, D/P, and (later) PP
 // all share one cached-model policy — the multi-node paths previously only
 // honored an explicit URI and never consulted the cache.
-func (o *Orchestrator) resolveS3Model(ctx context.Context, cfg RunConfig) (string, bool) {
+// s3Model is the resolved weight-load decision for a run.
+type s3Model struct {
+	URI       string // s3:// path when streaming, else ""
+	UseRunai  bool   // stream via the Run:ai streamer
+	SizeBytes int64  // model size when known (cached); 0 = unknown → default concurrency
+}
+
+func (o *Orchestrator) resolveS3Model(ctx context.Context, cfg RunConfig) s3Model {
 	if cfg.Request.ModelS3URI != "" {
+		// Explicit URI: size unknown (not looked up); streamer concurrency falls
+		// back to the profile default.
 		log.Printf("[%s] using S3 model: %s", cfg.RunID[:8], cfg.Request.ModelS3URI)
-		return cfg.Request.ModelS3URI, true
+		return s3Model{URI: cfg.Request.ModelS3URI, UseRunai: true}
 	}
 	if cfg.Request.ModelHfID != "" {
 		revision := cfg.Request.ModelHfRevision
@@ -587,11 +596,15 @@ func (o *Orchestrator) resolveS3Model(ctx context.Context, cfg RunConfig) (strin
 		}
 		cached, _ := o.repo.GetModelCacheByHfID(ctx, cfg.Request.ModelHfID, revision)
 		if cached != nil && cached.Status == "cached" {
+			var size int64
+			if cached.SizeBytes != nil {
+				size = *cached.SizeBytes
+			}
 			log.Printf("[%s] auto-detected cached model: %s", cfg.RunID[:8], cached.S3URI)
-			return cached.S3URI, true
+			return s3Model{URI: cached.S3URI, UseRunai: true, SizeBytes: size}
 		}
 	}
-	return "", false
+	return s3Model{}
 }
 
 func (o *Orchestrator) deployModel(ctx context.Context, ns, name string, cfg RunConfig) error {
@@ -613,7 +626,8 @@ func (o *Orchestrator) deployModel(ctx context.Context, ns, name string, cfg Run
 	cpuReq := fmt.Sprintf("%d", max(1, vcpus*3/4))
 	memReq := fmt.Sprintf("%dGi", max(1, memGiB*85/100))
 
-	modelS3URI, useRunai := o.resolveS3Model(ctx, cfg)
+	sm := o.resolveS3Model(ctx, cfg)
+	modelS3URI, useRunai := sm.URI, sm.UseRunai
 
 	// PRD-50 follow-up: the streamer is always used for S3-backed
 	// models. vLLM's default loader against an S3 URI fails in
@@ -623,13 +637,11 @@ func (o *Orchestrator) deployModel(ctx context.Context, ns, name string, cfg Run
 	// toggle was removed; memory_limit + concurrency remain as knobs
 	// that tune the streamer itself.
 
-	// PRD-50: concurrency knob. 0 = default (16, matching the upstream
-	// RUNAI_STREAMER_CONCURRENCY default on filesystem / was our
-	// hardcode before this PRD).
-	streamerConcurrency := cfg.Request.StreamerConcurrency
-	if streamerConcurrency == 0 {
-		streamerConcurrency = 16
-	}
+	// PRD-50: streamer read concurrency. Bandwidth-aware: explicit request value
+	// wins; else high-BW instances get AWS's size-derived value, others the
+	// benchmarked default (32). Computed via the shared runtime helper so the
+	// template's inline extra-config and BuildArgs agree.
+	streamerConcurrency := runtime.StreamerConcurrency(cfg.Request.StreamerConcurrency, sm.SizeBytes, cfg.InstanceType.Name)
 
 	// PRD-50: memory-limit knob. 0 = auto-size at half the node RAM.
 	// min(weight, instance_mem/2) isn't computed here — we let the
@@ -667,6 +679,8 @@ func (o *Orchestrator) deployModel(ctx context.Context, ns, name string, cfg Run
 		Quantization:           derefStr(cfg.Request.Quantization),
 		StreamerConcurrency:    streamerConcurrency,
 		StreamerMemoryLimitGiB: streamerMemLimitGiB,
+		ModelSizeBytes:         sm.SizeBytes,
+		InstanceTypeName:       cfg.InstanceType.Name,
 		ChunkedPrefillSize:     cfg.Request.ChunkedPrefillSize,
 		MemFractionStatic:      cfg.Request.MemFractionStatic,
 		AcceleratorName:        cfg.InstanceType.AcceleratorName,
@@ -696,6 +710,7 @@ func (o *Orchestrator) deployModel(ctx context.Context, ns, name string, cfg Run
 		UseRunaiStreamer:        useRunai,
 		ModelServiceAccount:     modelServiceAccount,
 		StreamerConcurrency:     streamerConcurrency,
+		StreamerChunkBytesize:   runtime.StreamerChunkBytesize(cfg.InstanceType.Name),
 		StreamerMemoryLimitGiB:  streamerMemLimitGiB,
 		PullThroughRegistry:     os.Getenv("PULL_THROUGH_REGISTRY"),
 		VLLMImageOverride:       ResolveVLLMImageOverride(),

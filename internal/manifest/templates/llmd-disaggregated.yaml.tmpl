@@ -664,12 +664,26 @@ spec:
             env:
               - name: HF_TOKEN
                 value: "{{ $p.HfToken }}"
-{{- /* PRD-65 Layer 3: cap the Run:ai streamer's shared CPU buffer during
-       weight load, mirroring the single-node model-deployment template. Only
-       emitted for a streamed (S3) load with a configured/auto-sized limit. */ -}}
+{{- /* Run:ai streamer tuning, mirroring the single-node model-deployment
+       template. Only emitted for a streamed (S3) load. */ -}}
+{{- if $p.UseRunaiStreamer }}
+              # S3 retry tuning (real in the streamer C++ source, undocumented in
+              # its markdown; defaults 1000ms / disabled).
+              - name: RUNAI_STREAMER_S3_REQUEST_TIMEOUT_MS
+                value: "3000"
+              - name: RUNAI_STREAMER_S3_LOW_SPEED_LIMIT
+                value: "1048576"
+{{- if $p.StreamerChunkBytesize }}
+              # High-bandwidth instance: AWS's 4 GiB chunk. Standard instances
+              # omit this and inherit the streamer's 8 MiB object-storage default.
+              - name: RUNAI_STREAMER_CHUNK_BYTESIZE
+                value: "{{ $p.StreamerChunkBytesize }}"
+{{- end }}
+{{- /* PRD-65 Layer 3: cap the streamer's shared CPU buffer during weight load. */ -}}
 {{- if gt $p.StreamerMemoryLimitGiB 0 }}
               - name: RUNAI_STREAMER_MEMORY_LIMIT
                 value: "{{ gibBytes $p.StreamerMemoryLimitGiB }}"
+{{- end }}
 {{- end }}
               # NIXL side channel MUST advertise the pod IP (localhost default
               # breaks cross-pod discovery → 120s timeouts, vLLM #30153).

@@ -140,7 +140,8 @@ func (o *Orchestrator) deployLLMDDisaggregated(ctx context.Context, ns, name str
 	// (PRD-65 Layer 2): explicit URI wins, else auto-detect a cached model.
 	// Safe on D/P because the upstream vllm/vllm-openai image bundles
 	// runai-model-streamer. (PP/llm-d-aws does NOT bundle it — deferred.)
-	modelS3URI, useRunai := o.resolveS3Model(ctx, cfg)
+	sm := o.resolveS3Model(ctx, cfg)
+	modelS3URI, useRunai := sm.URI, sm.UseRunai
 
 	prefillTP := cfg.PrefillTP
 	if prefillTP < 1 {
@@ -189,34 +190,44 @@ func (o *Orchestrator) deployLLMDDisaggregated(ctx context.Context, ns, name str
 	if streamerMemLimitGiB == 0 {
 		streamerMemLimitGiB = max(1, cfg.InstanceType.MemoryGiB/2)
 	}
-	buildServeArgs := func(maxNumBatchedTokens int) []string {
+	// buildServeArgs takes the per-role TP so streamerExtraConfig can emit
+	// distributed:true for TP>1 roles (each rank streams its own shard).
+	buildServeArgs := func(maxNumBatchedTokens, tp int) []string {
 		_, args := rt.BuildArgs(runtime.ContainerParams{
 			ModelHfID:              cfg.Request.ModelHfID,
 			ModelS3URI:             modelS3URI,
 			UseRunaiStreamer:       useRunai,
+			TensorParallelDegree:   tp,
 			MaxModelLen:            cfg.Request.MaxModelLen,
 			MaxNumBatchedTokens:    maxNumBatchedTokens,
 			KVCacheDtype:           cfg.Request.KVCacheDtype,
 			Quantization:           derefStr(cfg.Request.Quantization),
 			StreamerConcurrency:    cfg.Request.StreamerConcurrency,
 			StreamerMemoryLimitGiB: streamerMemLimitGiB,
+			ModelSizeBytes:         sm.SizeBytes,
+			InstanceTypeName:       cfg.InstanceType.Name,
 			AcceleratorName:        cfg.InstanceType.AcceleratorName,
 		})
 		return args
 	}
-	// Shared arg set (the default). Per-role sets are built ONLY when a role
-	// override is set — otherwise they stay nil and the template falls back to
-	// the shared set, keeping the render byte-identical to pre-PRD-64.
-	serveArgs := buildServeArgs(cfg.Request.MaxNumBatchedTokens)
+	// Shared arg set (the default / fallback). Uses the prefill role's TP as the
+	// representative value for the streamer distributed flag.
+	serveArgs := buildServeArgs(cfg.Request.MaxNumBatchedTokens, prefillTP)
 	var prefillServeArgs, decodeServeArgs, bothServeArgs []string
-	if cfg.PrefillMaxNumBatchedTokens > 0 {
-		prefillServeArgs = buildServeArgs(cfg.PrefillMaxNumBatchedTokens)
+	// Per-role arg sets are built when a role has a batch-token override OR when
+	// streaming (so each role's distributed:true reflects its OWN TP — a prefill
+	// role at TP=2 and decode at TP=1 must differ). When neither applies the
+	// per-role set stays nil and the template falls back to the shared serveArgs,
+	// keeping a non-streaming, no-override run byte-identical to pre-PRD-64.
+	perRoleForStreamer := useRunai
+	if cfg.PrefillMaxNumBatchedTokens > 0 || perRoleForStreamer {
+		prefillServeArgs = buildServeArgs(cfg.PrefillMaxNumBatchedTokens, prefillTP)
 	}
-	if cfg.DecodeMaxNumBatchedTokens > 0 {
-		decodeServeArgs = buildServeArgs(cfg.DecodeMaxNumBatchedTokens)
+	if cfg.DecodeMaxNumBatchedTokens > 0 || perRoleForStreamer {
+		decodeServeArgs = buildServeArgs(cfg.DecodeMaxNumBatchedTokens, decodeTP)
 	}
-	if cfg.BothMaxNumBatchedTokens > 0 {
-		bothServeArgs = buildServeArgs(cfg.BothMaxNumBatchedTokens)
+	if (cfg.BothMaxNumBatchedTokens > 0 || perRoleForStreamer) && bothReplicas > 0 {
+		bothServeArgs = buildServeArgs(cfg.BothMaxNumBatchedTokens, bothTP)
 	}
 
 	var modelServiceAccount string
@@ -289,11 +300,18 @@ func (o *Orchestrator) deployLLMDDisaggregated(ctx context.Context, ns, name str
 		ModelLabel:          modelLabelValue(cfg.Request.ModelHfID),
 		HfToken:             o.resolveHFToken(ctx, cfg.Request.HfToken),
 		ModelServiceAccount: modelServiceAccount,
+		UseRunaiStreamer:    useRunai,
 		StreamerMemoryLimitGiB: func() int {
 			if useRunai {
 				return streamerMemLimitGiB
 			}
 			return 0
+		}(),
+		StreamerChunkBytesize: func() string {
+			if useRunai {
+				return runtime.StreamerChunkBytesize(cfg.InstanceType.Name)
+			}
+			return ""
 		}(),
 		InstanceTypeName:    cfg.InstanceType.Name,
 		PrefillReplicas:     prefillReplicas,

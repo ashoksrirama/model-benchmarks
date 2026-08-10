@@ -38,6 +38,16 @@ type ContainerParams struct {
 	Quantization           string
 	StreamerConcurrency    int
 	StreamerMemoryLimitGiB int
+	// ModelSizeBytes is the S3-cached model's total size. On high-bandwidth
+	// instances it drives AWS's size-derived streamer concurrency
+	// (ceil(size_gb / 4gb-chunk)). 0 = unknown (not cached / size not recorded)
+	// → the profile's flat default concurrency.
+	ModelSizeBytes int64
+	// InstanceTypeName (e.g. "g6e.12xlarge") selects the Run:ai streamer tuning
+	// profile: high-bandwidth instances (>=50 Gbps) get AWS's large-chunk +
+	// size-derived-concurrency profile, everything else gets Run:ai's
+	// small-chunk default profile. Empty ⇒ standard profile.
+	InstanceTypeName string
 	// SGLang-specific knobs.
 	ChunkedPrefillSize  int
 	MemFractionStatic   float64

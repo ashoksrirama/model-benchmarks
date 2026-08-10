@@ -18,10 +18,11 @@ import (
 // cfg → resolveS3Model → buildServeArgs → render → applied Deployment.
 func TestDeployLLMDDisaggregated_StreamerParity(t *testing.T) {
 	strptr := func(s string) *string { return &s }
+	i64 := func(v int64) *int64 { return &v }
 	repo := database.NewMockRepo()
 	_, _ = repo.CreateModelCache(context.Background(), &database.ModelCache{
 		HfID: strptr("Qwen/Qwen2.5-1.5B-Instruct"), HfRevision: "main",
-		S3URI: "s3://accelbench-models/qwen", Status: "cached",
+		S3URI: "s3://accelbench-models/qwen", Status: "cached", SizeBytes: i64(40 * 1024 * 1024 * 1024),
 	})
 	dyn := newFakeDyn()
 	o := &Orchestrator{client: k8sfake.NewSimpleClientset(), repo: repo, dynClient: dyn}
@@ -34,8 +35,8 @@ func TestDeployLLMDDisaggregated_StreamerParity(t *testing.T) {
 			DeploymentMode:         "disaggregated",
 			StreamerMemoryLimitGiB: 16, // explicit → 16 GiB = 17179869184 bytes
 		},
-		InstanceType:    &database.InstanceType{Name: "g6.2xlarge", MemoryGiB: 32, VCPUs: 8, AcceleratorName: "L4"},
-		PrefillReplicas: 1, PrefillTP: 1, DecodeReplicas: 1, DecodeTP: 1,
+		InstanceType:    &database.InstanceType{Name: "g6e.12xlarge", MemoryGiB: 192, VCPUs: 48, AcceleratorName: "L40S"},
+		PrefillReplicas: 1, PrefillTP: 2, DecodeReplicas: 1, DecodeTP: 2, // TP>1 → distributed:true
 	}
 
 	if err := o.deployLLMDDisaggregated(context.Background(), "accelbench", "bench-run-pd-0001", cfg); err != nil {
@@ -49,16 +50,27 @@ func TestDeployLLMDDisaggregated_StreamerParity(t *testing.T) {
 	}
 	blob, _ := list.Items[0].MarshalJSON()
 	s := string(blob)
+	// g6e.12xlarge is high-bandwidth (100 Gbps) and the cached model is 40 GiB, so
+	// the streamer gets AWS's profile: 4 GiB chunk env + size-derived concurrency
+	// ceil(40/4)=10. (JSON-marshaled Deployment escapes the extra-config quotes,
+	// so assert the concurrency value via bare substrings.)
 	for _, want := range []string{
-		"runai_streamer",              // auto-detected cached model → streamer on
-		"s3://accelbench-models/qwen", // the cached S3 URI as the model arg
-		"memory_limit",                // Layer 3: memory-limit in extra-config
-		"RUNAI_STREAMER_MEMORY_LIMIT", // Layer 3: env on the container
-		"17179869184",                 // 16 GiB in bytes (extra-config + env value)
+		"runai_streamer",                // auto-detected cached model → streamer on
+		"s3://accelbench-models/qwen",   // the cached S3 URI as the model arg
+		"memory_limit",                  // Layer 3: memory-limit in extra-config
+		"RUNAI_STREAMER_MEMORY_LIMIT",   // Layer 3: env on the container
+		"17179869184",                   // 16 GiB in bytes (extra-config + env value)
+		"distributed",                   // TP>1 → each rank streams its own shard
+		"RUNAI_STREAMER_CHUNK_BYTESIZE", // high-BW instance → AWS 4 GiB chunk env
+		"4294967296",                    // 4 GiB chunk value
+		"RUNAI_STREAMER_S3_REQUEST_TIMEOUT_MS", // S3 retry envs on any streamed load
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("applied D/P Deployment missing %q", want)
 		}
+	}
+	if !strings.Contains(s, `concurrency\":10`) && !strings.Contains(s, `"concurrency":10`) {
+		t.Errorf("high-BW 40GiB model should give size-derived concurrency 10; got: %s", s)
 	}
 }
 

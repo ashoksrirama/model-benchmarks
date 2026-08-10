@@ -14,6 +14,11 @@ variable "cluster_name" {
   type        = string
 }
 
+variable "region" {
+  description = "AWS region (used to build the S3 Gateway VPC endpoint service name)"
+  type        = string
+}
+
 variable "single_nat_gateway" {
   description = "Use a single NAT gateway (cost savings for non-prod)"
   type        = bool
