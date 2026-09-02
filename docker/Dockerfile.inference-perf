@@ -26,10 +26,18 @@ RUN apk add --no-cache \
       build-base \
       cmake \
       ninja \
-      pkgconfig
-# sentencepiece bundles its own C++ source and tries to fetch GoogleTest
-# during build; the setup script's bootstrap needs bash.
-RUN apk add --no-cache bash
+      pkgconfig \
+      linux-headers
+# Alpine's build-base omits the Linux kernel UAPI headers; abseil-cpp
+# (vendored by sentencepiece) includes <linux/futex.h> in its spinlock
+# code and fails with "linux/futex.h: No such file or directory" without
+# the linux-headers package.
+#
+# sentencepiece bundles its own C++ source and, during the wheel build,
+# CMake FetchContent CLONES abseil-cpp (and GoogleTest) over git — without
+# git the build dies with "could not find git for clone of
+# abseil-cpp-populate". bash is needed by the setup script's bootstrap.
+RUN apk add --no-cache bash git
 RUN pip wheel --no-cache-dir --wheel-dir /wheels protobuf
 # Give the sentencepiece build script enough cores so the ~5-minute
 # compile doesn't dominate total build time.

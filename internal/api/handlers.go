@@ -274,6 +274,9 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	p.Handle("DELETE /api/v1/config/credentials/hf-token", admin(http.HandlerFunc(s.handleDeleteHFToken)))
 	p.Handle("PUT /api/v1/config/credentials/dockerhub-token", admin(http.HandlerFunc(s.handlePutDockerHubToken)))
 	p.Handle("DELETE /api/v1/config/credentials/dockerhub-token", admin(http.HandlerFunc(s.handleDeleteDockerHubToken)))
+	// PRD-66 Part 2a: GHCR token (llm-d-aws pull-through cache)
+	p.Handle("PUT /api/v1/config/credentials/ghcr-token", admin(http.HandlerFunc(s.handlePutGHCRToken)))
+	p.Handle("DELETE /api/v1/config/credentials/ghcr-token", admin(http.HandlerFunc(s.handleDeleteGHCRToken)))
 	// PRD-32: Catalog matrix editor, scenario overrides, registry, audit log
 	p.Handle("GET /api/v1/config/catalog-matrix", admin(http.HandlerFunc(s.handleGetCatalogMatrix)))
 	p.Handle("PUT /api/v1/config/catalog-matrix", admin(http.HandlerFunc(s.handlePutCatalogMatrix)))
@@ -538,6 +541,252 @@ func (s *Server) CreateRun(ctx context.Context, req *database.RunRequest) (strin
 		streamerMemLimitPtr = &n
 	}
 
+	// PRD-57/58: distributed-run validation + persisted topology. "distributed"
+	// (co-located multi-node) and "disaggregated" (prefill/decode split) trigger
+	// the multi-node path; "" / "single" take the existing single-instance flow
+	// untouched. Per-role fields (prefill_*/decode_*/kv_*) are populated only for
+	// the disaggregated branch.
+	var deploymentModePtr, networkModePtr *string
+	var nodeCountPtr, ppPtr *int
+	var prefillReplicasPtr, prefillTPPtr, prefillPPPtr *int
+	var decodeReplicasPtr, decodeTPPtr, decodePPPtr *int
+	var bothReplicasPtr, bothTPPtr *int          // PRD-63 co-located "both" pool
+	var prefillMaxNBTPtr, decodeMaxNBTPtr, bothMaxNBTPtr *int // PRD-64/63 per-role scheduler override
+	var kvConnectorPtr, kvBackendPtr *string
+	// PRD-61: run-tunable EPP routing config (disaggregated only).
+	var pdNonCachedPtr, pdPrefixWeightPtr, pdQueueWeightPtr, pdMaxPrefixBlocksPtr, pdLRUCapacityPtr *int
+	var pdDeciderStrategyPtr *string
+	// PRD-61: routing knobs are meaningless without an EPP — reject them on any
+	// non-disaggregated run rather than silently ignoring them.
+	if req.DeploymentMode != "disaggregated" {
+		if req.PDNonCachedTokens != nil || req.PDPrefixCacheWeight != 0 || req.PDQueueScorerWeight != 0 ||
+			req.PDMaxPrefixBlocks != 0 || req.PDLRUCapacityPerServer != 0 || req.PDDeciderStrategy != "" {
+			return "", &createRunError{http.StatusBadRequest, "EPP routing config (pd_*) is only valid for disaggregated runs"}
+		}
+	}
+	if req.DeploymentMode == "disaggregated" {
+		if req.Framework != "llm-d" {
+			return "", &createRunError{http.StatusBadRequest, "disaggregated runs require framework=llm-d"}
+		}
+		if instType.AcceleratorType != "gpu" {
+			return "", &createRunError{http.StatusBadRequest, "disaggregated runs require a GPU instance type"}
+		}
+		gpn := instType.AcceleratorCount
+		// PRD-63: per-role replica counts are combination-validated (not each
+		// >= 1). "both" is additive; a run may set any subset of {prefill,
+		// decode, both} with replicas >= 0. Rejections:
+		//   * any role negative
+		//   * total node sum < 1 (nothing to run)
+		//   * prefill > 0 with NO decode-capable pool (decode or both) — a lone
+		//     prefill pool can't finish a disaggregated request.
+		if req.PrefillReplicas < 0 || req.DecodeReplicas < 0 || req.BothReplicas < 0 {
+			return "", &createRunError{http.StatusBadRequest, "prefill_replicas / decode_replicas / both_replicas must be >= 0"}
+		}
+		if req.PrefillReplicas+req.DecodeReplicas+req.BothReplicas < 1 {
+			return "", &createRunError{http.StatusBadRequest, "disaggregated runs need at least one pool (prefill, decode, or both) with replicas >= 1"}
+		}
+		if req.PrefillReplicas > 0 && req.DecodeReplicas == 0 && req.BothReplicas == 0 {
+			return "", &createRunError{http.StatusBadRequest, "a prefill pool needs a decode-capable pool (decode or both) to finish requests"}
+		}
+		// Per-role TP is within-node: default 1 (no tensor sharding), bounded by
+		// the node's GPU count. Independent knobs per role (AWS reference:
+		// prefill TP=1, decode TP=4).
+		pTP, dTP, bTP := req.PrefillTP, req.DecodeTP, req.BothTP
+		if pTP < 1 {
+			pTP = 1
+		}
+		if dTP < 1 {
+			dTP = 1
+		}
+		if bTP < 1 {
+			bTP = 1
+		}
+		if gpn > 0 && pTP > gpn {
+			return "", &createRunError{http.StatusBadRequest, fmt.Sprintf("prefill_tp (%d) exceeds the instance's GPUs per node (%d)", pTP, gpn)}
+		}
+		if gpn > 0 && dTP > gpn {
+			return "", &createRunError{http.StatusBadRequest, fmt.Sprintf("decode_tp (%d) exceeds the instance's GPUs per node (%d)", dTP, gpn)}
+		}
+		if gpn > 0 && bTP > gpn {
+			return "", &createRunError{http.StatusBadRequest, fmt.Sprintf("both_tp (%d) exceeds the instance's GPUs per node (%d)", bTP, gpn)}
+		}
+		// Per-role PP > 1 (multi-node-per-role) is a documented follow-on: a
+		// Deployment can't express multi-node --nnodes coordination. Constrain
+		// to 1 (each role pod is single-node; scale via replicas).
+		pPP, dPP := req.PrefillPP, req.DecodePP
+		if pPP < 1 {
+			pPP = 1
+		}
+		if dPP < 1 {
+			dPP = 1
+		}
+		if pPP != 1 || dPP != 1 {
+			return "", &createRunError{http.StatusBadRequest, "per-role pipeline-parallel > 1 is not yet supported for disaggregated runs (scale via replicas)"}
+		}
+		if req.NetworkMode != "" && req.NetworkMode != "efa" && req.NetworkMode != "tcp" {
+			return "", &createRunError{http.StatusBadRequest, "network_mode must be 'efa' or 'tcp'"}
+		}
+		// Each role pod is one node (TP within-node, PP=1). The node total sums
+		// all three pools. PRD-63 relaxes the floor to >= 1 (a "both"-only pool
+		// serves everything locally and needs no separate node).
+		totalNodes := req.PrefillReplicas*pPP + req.DecodeReplicas*dPP + req.BothReplicas
+		if totalNodes < 1 {
+			return "", &createRunError{http.StatusBadRequest, "disaggregated runs need at least 1 serving node"}
+		}
+
+		dm := "disaggregated"
+		deploymentModePtr = &dm
+		nc := totalNodes
+		nodeCountPtr = &nc
+		nm := req.NetworkMode
+		if nm == "" {
+			nm = "efa"
+		}
+		networkModePtr = &nm
+		req.NetworkMode = nm
+		req.PrefillTP, req.DecodeTP, req.PrefillPP, req.DecodePP = pTP, dTP, pPP, dPP
+		req.BothTP = bTP
+		// Persist each pool that is present. A role with 0 replicas stays NULL so
+		// the row is self-describing (a both-only run has null prefill/decode).
+		if req.PrefillReplicas > 0 {
+			pr, pt, pp := req.PrefillReplicas, pTP, pPP
+			prefillReplicasPtr, prefillTPPtr, prefillPPPtr = &pr, &pt, &pp
+		}
+		if req.DecodeReplicas > 0 {
+			dr, dt, dp := req.DecodeReplicas, dTP, dPP
+			decodeReplicasPtr, decodeTPPtr, decodePPPtr = &dr, &dt, &dp
+		}
+		if req.BothReplicas > 0 {
+			br, bt := req.BothReplicas, bTP
+			bothReplicasPtr, bothTPPtr = &br, &bt
+		}
+		// KV connector/backend are derived from the fabric (nixl over tcp|libfabric),
+		// surfaced in results so a disaggregated run is self-describing.
+		kvc := "nixl"
+		kvConnectorPtr = &kvc
+		kvb := "libfabric"
+		if nm == "tcp" {
+			kvb = "tcp"
+		}
+		kvBackendPtr = &kvb
+		// PRD-64: optional per-role scheduler override. Positive when set; null
+		// (0) ⇒ role inherits the shared max_num_batched_tokens. Bound matches
+		// the shared knob (> 0).
+		if req.PrefillMaxNumBatchedTokens < 0 || req.DecodeMaxNumBatchedTokens < 0 || req.BothMaxNumBatchedTokens < 0 {
+			return "", &createRunError{http.StatusBadRequest, "per-role max_num_batched_tokens must be positive"}
+		}
+		if req.PrefillMaxNumBatchedTokens > 0 {
+			v := req.PrefillMaxNumBatchedTokens
+			prefillMaxNBTPtr = &v
+		}
+		if req.DecodeMaxNumBatchedTokens > 0 {
+			v := req.DecodeMaxNumBatchedTokens
+			decodeMaxNBTPtr = &v
+		}
+		if req.BothMaxNumBatchedTokens > 0 {
+			v := req.BothMaxNumBatchedTokens
+			bothMaxNBTPtr = &v
+		}
+		// PRD-61: run-tunable EPP routing config. Each is optional; omitted →
+		// persist NULL → orchestrator applies the shipped default (byte-identical
+		// to today). Bounds are conservative; a bad-but-in-range value degrades
+		// only this run's routing (which, for a benchmark, is the point — bound,
+		// don't forbid).
+		if req.PDNonCachedTokens != nil {
+			// 0 is meaningful (disable disaggregation); cap the upper bound.
+			if *req.PDNonCachedTokens < 0 || *req.PDNonCachedTokens > 32768 {
+				return "", &createRunError{http.StatusBadRequest, "pd_noncached_tokens must be between 0 and 32768"}
+			}
+			v := *req.PDNonCachedTokens
+			pdNonCachedPtr = &v
+		}
+		// Scorer weights: relative small integers, 1..100 when set (0 = omitted).
+		if req.PDPrefixCacheWeight < 0 || req.PDPrefixCacheWeight > 100 ||
+			req.PDQueueScorerWeight < 0 || req.PDQueueScorerWeight > 100 {
+			return "", &createRunError{http.StatusBadRequest, "pd scorer weights must be between 1 and 100"}
+		}
+		if req.PDPrefixCacheWeight > 0 {
+			v := req.PDPrefixCacheWeight
+			pdPrefixWeightPtr = &v
+		}
+		if req.PDQueueScorerWeight > 0 {
+			v := req.PDQueueScorerWeight
+			pdQueueWeightPtr = &v
+		}
+		if req.PDMaxPrefixBlocks < 0 || req.PDMaxPrefixBlocks > 4096 {
+			return "", &createRunError{http.StatusBadRequest, "pd_max_prefix_blocks must be between 1 and 4096"}
+		}
+		if req.PDMaxPrefixBlocks > 0 {
+			v := req.PDMaxPrefixBlocks
+			pdMaxPrefixBlocksPtr = &v
+		}
+		if req.PDLRUCapacityPerServer < 0 || req.PDLRUCapacityPerServer > 10000000 {
+			return "", &createRunError{http.StatusBadRequest, "pd_lru_capacity_per_server out of range"}
+		}
+		if req.PDLRUCapacityPerServer > 0 {
+			v := req.PDLRUCapacityPerServer
+			pdLRUCapacityPtr = &v
+		}
+		// Decider strategy: "threshold" (default) is the only rendered path.
+		// "always" needs peakPrefillThroughput calibration (out of scope) — gate it.
+		if req.PDDeciderStrategy != "" {
+			if req.PDDeciderStrategy == "always" {
+				return "", &createRunError{http.StatusBadRequest, "pd_decider_strategy 'always' requires peakPrefillThroughput calibration (not yet supported); use 'threshold'"}
+			}
+			if req.PDDeciderStrategy != "threshold" {
+				return "", &createRunError{http.StatusBadRequest, "pd_decider_strategy must be 'threshold' or 'always'"}
+			}
+			v := req.PDDeciderStrategy
+			pdDeciderStrategyPtr = &v
+		}
+	} else if req.DeploymentMode == "distributed" {
+		if req.Framework != "llm-d" {
+			return "", &createRunError{http.StatusBadRequest, "distributed runs require framework=llm-d"}
+		}
+		if instType.AcceleratorType != "gpu" {
+			return "", &createRunError{http.StatusBadRequest, "distributed runs require a GPU instance type"}
+		}
+		if req.NodeCount < 2 {
+			return "", &createRunError{http.StatusBadRequest, "distributed runs require node_count >= 2"}
+		}
+		// vLLM multi-node mapping: TP is WITHIN a node, PP spans nodes. These
+		// are INDEPENDENT knobs — we do NOT force TP to fill the node, so
+		// pipeline-parallel WITHOUT tensor-parallel (TP=1) is a first-class
+		// topology (validated green in PRD-56). Constraints are just the
+		// physical bounds:
+		//   * TP in [1, GPUs-per-node]  — TP can't exceed a node's GPUs.
+		//   * PP in [2, node_count]     — PP spans nodes; needs >= 2 to be
+		//     distributed, and can't exceed the nodes we're scaling out.
+		tp := req.TensorParallelDegree
+		if tp < 1 {
+			tp = 1 // default: no within-node tensor sharding (PP-only)
+		}
+		if instType.AcceleratorCount > 0 && tp > instType.AcceleratorCount {
+			return "", &createRunError{http.StatusBadRequest, fmt.Sprintf("tensor_parallel_degree (%d) exceeds the instance's GPUs per node (%d)", tp, instType.AcceleratorCount)}
+		}
+		req.TensorParallelDegree = tp
+		if req.PipelineParallelDegree < 2 {
+			return "", &createRunError{http.StatusBadRequest, fmt.Sprintf("pipeline_parallel_degree (%d) must be >= 2 for a distributed run", req.PipelineParallelDegree)}
+		}
+		if req.PipelineParallelDegree > req.NodeCount {
+			return "", &createRunError{http.StatusBadRequest, fmt.Sprintf("pipeline_parallel_degree (%d) cannot exceed node_count (%d)", req.PipelineParallelDegree, req.NodeCount)}
+		}
+		if req.NetworkMode != "" && req.NetworkMode != "efa" && req.NetworkMode != "tcp" {
+			return "", &createRunError{http.StatusBadRequest, "network_mode must be 'efa' or 'tcp'"}
+		}
+		dm := "distributed"
+		deploymentModePtr = &dm
+		nc := req.NodeCount
+		nodeCountPtr = &nc
+		pp := req.PipelineParallelDegree
+		ppPtr = &pp
+		nm := req.NetworkMode
+		if nm == "" {
+			nm = "efa"
+		}
+		networkModePtr = &nm
+	}
+
 	run := &database.BenchmarkRun{
 		ModelID:                model.ID,
 		InstanceTypeID:         instType.ID,
@@ -560,6 +809,29 @@ func (s *Server) CreateRun(ctx context.Context, req *database.RunRequest) (strin
 		StreamerConcurrency:    streamerConcurrencyPtr,
 		StreamerMemoryLimitGiB: streamerMemLimitPtr,
 		ModelS3URI:             s3URIPtr,
+		DeploymentMode:         deploymentModePtr,
+		NodeCount:              nodeCountPtr,
+		PipelineParallelDegree: ppPtr,
+		NetworkMode:            networkModePtr,
+		PrefillReplicas:        prefillReplicasPtr,
+		PrefillTP:              prefillTPPtr,
+		PrefillPP:              prefillPPPtr,
+		DecodeReplicas:         decodeReplicasPtr,
+		DecodeTP:               decodeTPPtr,
+		DecodePP:               decodePPPtr,
+		BothReplicas:           bothReplicasPtr,
+		BothTP:                 bothTPPtr,
+		KVConnector:            kvConnectorPtr,
+		KVTransferBackend:      kvBackendPtr,
+		PrefillMaxNumBatchedTokens: prefillMaxNBTPtr,
+		DecodeMaxNumBatchedTokens:  decodeMaxNBTPtr,
+		BothMaxNumBatchedTokens:    bothMaxNBTPtr,
+		PDNonCachedTokens:      pdNonCachedPtr,
+		PDPrefixCacheWeight:    pdPrefixWeightPtr,
+		PDQueueScorerWeight:    pdQueueWeightPtr,
+		PDMaxPrefixBlocks:      pdMaxPrefixBlocksPtr,
+		PDLRUCapacityPerServer: pdLRUCapacityPtr,
+		PDDeciderStrategy:      pdDeciderStrategyPtr,
 		Status:                 "pending",
 	}
 
@@ -576,6 +848,40 @@ func (s *Server) CreateRun(ctx context.Context, req *database.RunRequest) (strin
 			Model:        model,
 			InstanceType: instType,
 			Request:      req,
+			// PRD-56/57: distributed topology. Zero/empty ⇒ single-node path.
+			NodeCount:              req.NodeCount,
+			PipelineParallelDegree: req.PipelineParallelDegree,
+			GPUsPerNode:            req.GPUsPerNode,
+			NetworkMode:            req.NetworkMode,
+			NodePoolOverride:       req.NodePoolOverride,
+		}
+		// PRD-58: for a disaggregated run the node total is the sum of the
+		// prefill + decode groups (each pod is one node). Set NodeCount from
+		// that sum (nodeCountPtr, computed + validated above) so the shared
+		// pool-acquire / scale / teardown / cost paths key on the right count,
+		// and thread the per-role shape into the config.
+		if req.DeploymentMode == "disaggregated" {
+			if nodeCountPtr != nil {
+				cfg.NodeCount = *nodeCountPtr
+			}
+			cfg.PrefillReplicas = req.PrefillReplicas
+			cfg.PrefillTP = req.PrefillTP
+			cfg.DecodeReplicas = req.DecodeReplicas
+			cfg.DecodeTP = req.DecodeTP
+			// PRD-63: co-located "both" pool.
+			cfg.BothReplicas = req.BothReplicas
+			cfg.BothTP = req.BothTP
+			// PRD-64/63: per-role scheduler override (0 ⇒ inherit shared).
+			cfg.PrefillMaxNumBatchedTokens = req.PrefillMaxNumBatchedTokens
+			cfg.DecodeMaxNumBatchedTokens = req.DecodeMaxNumBatchedTokens
+			cfg.BothMaxNumBatchedTokens = req.BothMaxNumBatchedTokens
+			// PRD-61: run-tunable EPP routing config (nil/0 ⇒ orchestrator default).
+			cfg.PDNonCachedTokens = pdNonCachedPtr
+			cfg.PDPrefixCacheScorerWeight = req.PDPrefixCacheWeight
+			cfg.PDQueueScorerWeight = req.PDQueueScorerWeight
+			cfg.PDMaxPrefixBlocks = req.PDMaxPrefixBlocks
+			cfg.PDLRUCapacityPerServer = req.PDLRUCapacityPerServer
+			cfg.PDDeciderStrategy = req.PDDeciderStrategy
 		}
 		if err := s.orch.Execute(context.Background(), cfg); err != nil {
 			log.Printf("benchmark run %s failed: %v", runID, err)
@@ -665,6 +971,14 @@ func (s *Server) fetchRunIncludes(ctx context.Context, resp *runDetailResponse, 
 				setErr("metrics", err.Error())
 				return nil
 			}
+			// PRD-59: attach the per-node/per-role GPU breakdown for distributed
+			// runs. Empty for single-instance runs (no shard rows), so the
+			// single-node response is unchanged.
+			if m != nil {
+				if shards, serr := s.repo.GetShardMetrics(ctx, resp.ID); serr == nil {
+					m.Shards = shards
+				}
+			}
 			mu.Lock()
 			resp.Metrics = m
 			mu.Unlock()
@@ -743,6 +1057,12 @@ func (s *Server) handleGetMetrics(w http.ResponseWriter, r *http.Request) {
 	if m == nil {
 		writeError(w, http.StatusNotFound, "metrics not found")
 		return
+	}
+	// PRD-59: attach the per-node/per-role GPU breakdown, matching the detail
+	// endpoint (GET /runs/{id}?include=metrics). Empty for single-instance runs
+	// (no shard rows), so single-node responses are unchanged.
+	if shards, serr := s.repo.GetShardMetrics(r.Context(), runID); serr == nil {
+		m.Shards = shards
 	}
 	writeJSON(w, http.StatusOK, m)
 }
@@ -956,12 +1276,7 @@ func (s *Server) handleRecommend(w http.ResponseWriter, r *http.Request) {
 	// Fetch model config (from S3 cache if available, else HuggingFace).
 	modelCfg, err := s.FetchModelConfig(r.Context(), modelID, hfToken)
 	if err != nil {
-		var hfErr *recommend.HFError
-		if errors.As(err, &hfErr) {
-			writeError(w, hfErr.StatusCode, hfErr.Message)
-			return
-		}
-		writeError(w, http.StatusBadGateway, "failed to fetch model metadata from HuggingFace")
+		writeHFError(w, err)
 		return
 	}
 
@@ -1147,6 +1462,28 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func writeError(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
+}
+
+// writeHFError translates an error from FetchModelConfig into an HTTP
+// response. It exists so a gated/unauthorized HuggingFace model never
+// surfaces to the browser as the API's own 401/403: the frontend's
+// fetchJSON treats any 401 as a session expiry and bounces the user to
+// /login (see frontend/src/api.ts). HuggingFace 401/403 (gated model,
+// missing/expired platform token, or HF rate-limiting) is a
+// request-level problem, not an auth failure, so we remap it to 422
+// Unprocessable Entity. The original message ("model is gated — provide
+// an HF token …") is preserved. Non-HFError failures become 502.
+func writeHFError(w http.ResponseWriter, err error) {
+	var hfErr *recommend.HFError
+	if errors.As(err, &hfErr) {
+		code := hfErr.StatusCode
+		if code == http.StatusUnauthorized || code == http.StatusForbidden {
+			code = http.StatusUnprocessableEntity
+		}
+		writeError(w, code, hfErr.Message)
+		return
+	}
+	writeError(w, http.StatusBadGateway, "failed to fetch model metadata from HuggingFace")
 }
 
 // handleListScenarios returns all available benchmark scenarios.

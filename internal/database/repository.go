@@ -193,8 +193,17 @@ func (r *Repository) CreateBenchmarkRun(ctx context.Context, run *BenchmarkRun) 
 		     run_type, status, max_model_len, scenario_id,
 		     model_s3_uri, max_num_batched_tokens, kv_cache_dtype,
 		     chunked_prefill_size, mem_fraction_static,
-		     streamer_mode, streamer_concurrency, streamer_memory_limit_gib)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+		     streamer_mode, streamer_concurrency, streamer_memory_limit_gib,
+		     deployment_mode, node_count, pipeline_parallel_degree, network_mode,
+		     prefill_replicas, prefill_tp, prefill_pp,
+		     decode_replicas, decode_tp, decode_pp,
+		     kv_connector, kv_transfer_backend,
+		     prefill_max_num_batched_tokens, decode_max_num_batched_tokens,
+		     both_replicas, both_tp, both_max_num_batched_tokens,
+		     pd_noncached_tokens, pd_prefix_cache_weight, pd_queue_scorer_weight,
+		     pd_max_prefix_blocks, pd_lru_capacity_per_server, pd_decider_strategy)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,
+		         $27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45)
 		 RETURNING id`,
 		run.ModelID, run.InstanceTypeID, run.Framework, run.FrameworkVersion,
 		run.TensorParallelDegree, run.Quantization, run.Concurrency,
@@ -209,6 +218,29 @@ func (r *Repository) CreateBenchmarkRun(ctx context.Context, run *BenchmarkRun) 
 		run.StreamerMode,
 		run.StreamerConcurrency,
 		run.StreamerMemoryLimitGiB,
+		run.DeploymentMode,
+		run.NodeCount,
+		run.PipelineParallelDegree,
+		run.NetworkMode,
+		run.PrefillReplicas,
+		run.PrefillTP,
+		run.PrefillPP,
+		run.DecodeReplicas,
+		run.DecodeTP,
+		run.DecodePP,
+		run.KVConnector,
+		run.KVTransferBackend,
+		run.PrefillMaxNumBatchedTokens,
+		run.DecodeMaxNumBatchedTokens,
+		run.BothReplicas,
+		run.BothTP,
+		run.BothMaxNumBatchedTokens,
+		run.PDNonCachedTokens,
+		run.PDPrefixCacheWeight,
+		run.PDQueueScorerWeight,
+		run.PDMaxPrefixBlocks,
+		run.PDLRUCapacityPerServer,
+		run.PDDeciderStrategy,
 	).Scan(&id)
 	if err != nil {
 		return "", fmt.Errorf("insert benchmark run: %w", err)
@@ -374,9 +406,16 @@ func (r *Repository) PersistMetrics(ctx context.Context, runID string, m *Benchm
 		     running_requests_avg, running_requests_max, output_length_mean,
 		     sm_active_avg_pct, sm_active_peak_pct,
 		     tensor_active_avg_pct, tensor_active_peak_pct,
-		     dram_active_avg_pct, dram_active_peak_pct)
+		     dram_active_avg_pct, dram_active_peak_pct,
+		     accelerator_memory_total_gib,
+		     kv_transfer_time_avg_ms, kv_transfer_bytes_total, kv_transfer_failures,
+		     prefill_time_server_avg_ms, decode_time_server_avg_ms,
+		     external_prefix_cache_hit_rate,
+		     disagg_prefill_decode_count, disagg_decode_only_count, disagg_engaged_rate_pct,
+		     pool_kv_cache_util_pct, pool_queue_size_avg)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,
-		         $24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45)
+		         $24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,
+		         $47,$48,$49,$50,$51,$52,$53,$54,$55,$56,$57)
 		 RETURNING id`,
 		runID,
 		m.TTFTP50Ms, m.TTFTP90Ms, m.TTFTP95Ms, m.TTFTP99Ms,
@@ -396,9 +435,38 @@ func (r *Repository) PersistMetrics(ctx context.Context, runID string, m *Benchm
 		m.SMActiveAvgPct, m.SMActivePeakPct,
 		m.TensorActiveAvgPct, m.TensorActivePeakPct,
 		m.DRAMActiveAvgPct, m.DRAMActivePeakPct,
+		m.AcceleratorMemoryTotalGiB,
+		m.KVTransferTimeAvgMs, m.KVTransferBytesTotal, m.KVTransferFailures,
+		m.PrefillTimeServerAvgMs, m.DecodeTimeServerAvgMs,
+		m.ExternalPrefixCacheHitRate,
+		m.DisaggPrefillDecodeCount, m.DisaggDecodeOnlyCount, m.DisaggEngagedRatePct,
+		m.PoolKVCacheUtilPct, m.PoolQueueSizeAvg,
 	).Scan(&metricsID)
 	if err != nil {
 		return fmt.Errorf("insert metrics: %w", err)
+	}
+
+	// PRD-59: persist the per-node/per-role GPU breakdown (distributed runs
+	// only; Shards is empty for single-instance runs, so this is a no-op there).
+	for _, sh := range m.Shards {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO benchmark_metrics_by_shard
+			    (run_id, node, role, samples,
+			     utilization_avg_pct, utilization_peak_pct,
+			     memory_avg_gib, memory_peak_gib,
+			     sm_active_avg_pct, sm_active_peak_pct,
+			     tensor_active_avg_pct, tensor_active_peak_pct,
+			     dram_active_avg_pct, dram_active_peak_pct)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+			runID, sh.Node, sh.Role, sh.Samples,
+			sh.UtilizationAvgPct, sh.UtilizationPeakPct,
+			sh.MemoryAvgGiB, sh.MemoryPeakGiB,
+			sh.SMActiveAvgPct, sh.SMActivePeakPct,
+			sh.TensorActiveAvgPct, sh.TensorActivePeakPct,
+			sh.DRAMActiveAvgPct, sh.DRAMActivePeakPct,
+		); err != nil {
+			return fmt.Errorf("insert shard metric (%s/%s): %w", sh.Node, sh.Role, err)
+		}
 	}
 
 	// Verify the write by reading it back.
@@ -441,7 +509,15 @@ func (r *Repository) GetBenchmarkRun(ctx context.Context, runID string) (*Benchm
 		        total_cost_usd, loadgen_cost_usd, owner_pod, cancel_requested,
 		        max_num_batched_tokens, scenario_id, kv_cache_dtype,
 		        host_memory_peak_gib,
-		        streamer_mode, streamer_concurrency, streamer_memory_limit_gib
+		        streamer_mode, streamer_concurrency, streamer_memory_limit_gib,
+		        deployment_mode, node_count, pipeline_parallel_degree, network_mode,
+		        prefill_replicas, prefill_tp, prefill_pp,
+		        decode_replicas, decode_tp, decode_pp,
+		        kv_connector, kv_transfer_backend,
+		        prefill_max_num_batched_tokens, decode_max_num_batched_tokens,
+		        both_replicas, both_tp, both_max_num_batched_tokens,
+		        pd_noncached_tokens, pd_prefix_cache_weight, pd_queue_scorer_weight,
+		        pd_max_prefix_blocks, pd_lru_capacity_per_server, pd_decider_strategy
 		 FROM benchmark_runs WHERE id = $1`, runID,
 	).Scan(&run.ID, &run.ModelID, &run.InstanceTypeID, &run.Framework, &run.FrameworkVersion,
 		&run.TensorParallelDegree, &run.Quantization, &run.Concurrency,
@@ -451,7 +527,15 @@ func (r *Repository) GetBenchmarkRun(ctx context.Context, runID string) (*Benchm
 		&run.TotalCostUSD, &run.LoadgenCostUSD, &run.OwnerPod, &run.CancelRequested,
 		&run.MaxNumBatchedTokens, &run.ScenarioID, &run.KVCacheDtype,
 		&run.HostMemoryPeakGiB,
-		&run.StreamerMode, &run.StreamerConcurrency, &run.StreamerMemoryLimitGiB)
+		&run.StreamerMode, &run.StreamerConcurrency, &run.StreamerMemoryLimitGiB,
+		&run.DeploymentMode, &run.NodeCount, &run.PipelineParallelDegree, &run.NetworkMode,
+		&run.PrefillReplicas, &run.PrefillTP, &run.PrefillPP,
+		&run.DecodeReplicas, &run.DecodeTP, &run.DecodePP,
+		&run.KVConnector, &run.KVTransferBackend,
+		&run.PrefillMaxNumBatchedTokens, &run.DecodeMaxNumBatchedTokens,
+		&run.BothReplicas, &run.BothTP, &run.BothMaxNumBatchedTokens,
+		&run.PDNonCachedTokens, &run.PDPrefixCacheWeight, &run.PDQueueScorerWeight,
+		&run.PDMaxPrefixBlocks, &run.PDLRUCapacityPerServer, &run.PDDeciderStrategy)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -519,7 +603,13 @@ func (r *Repository) GetMetricsByRunID(ctx context.Context, runID string) (*Benc
 		        running_requests_avg, running_requests_max, output_length_mean,
 		        sm_active_avg_pct, sm_active_peak_pct,
 		        tensor_active_avg_pct, tensor_active_peak_pct,
-		        dram_active_avg_pct, dram_active_peak_pct
+		        dram_active_avg_pct, dram_active_peak_pct,
+		        accelerator_memory_total_gib,
+		        kv_transfer_time_avg_ms, kv_transfer_bytes_total, kv_transfer_failures,
+		        prefill_time_server_avg_ms, decode_time_server_avg_ms,
+		        external_prefix_cache_hit_rate,
+		        disagg_prefill_decode_count, disagg_decode_only_count, disagg_engaged_rate_pct,
+		        pool_kv_cache_util_pct, pool_queue_size_avg
 		 FROM benchmark_metrics WHERE run_id = $1`, runID,
 	).Scan(&m.ID, &m.RunID,
 		&m.TTFTP50Ms, &m.TTFTP90Ms, &m.TTFTP95Ms, &m.TTFTP99Ms,
@@ -538,7 +628,13 @@ func (r *Repository) GetMetricsByRunID(ctx context.Context, runID string) (*Benc
 		&m.RunningRequestsAvg, &m.RunningRequestsMax, &m.OutputLengthMean,
 		&m.SMActiveAvgPct, &m.SMActivePeakPct,
 		&m.TensorActiveAvgPct, &m.TensorActivePeakPct,
-		&m.DRAMActiveAvgPct, &m.DRAMActivePeakPct)
+		&m.DRAMActiveAvgPct, &m.DRAMActivePeakPct,
+		&m.AcceleratorMemoryTotalGiB,
+		&m.KVTransferTimeAvgMs, &m.KVTransferBytesTotal, &m.KVTransferFailures,
+		&m.PrefillTimeServerAvgMs, &m.DecodeTimeServerAvgMs,
+		&m.ExternalPrefixCacheHitRate,
+		&m.DisaggPrefillDecodeCount, &m.DisaggDecodeOnlyCount, &m.DisaggEngagedRatePct,
+		&m.PoolKVCacheUtilPct, &m.PoolQueueSizeAvg)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -546,4 +642,37 @@ func (r *Repository) GetMetricsByRunID(ctx context.Context, runID string) (*Benc
 		return nil, fmt.Errorf("query metrics: %w", err)
 	}
 	return &m, nil
+}
+
+// GetShardMetrics returns the per-node/per-role GPU breakdown for a run
+// (PRD-59). Empty for single-instance runs (which write no shard rows). Ordered
+// by insertion (id) so prefill precedes decode as applied.
+func (r *Repository) GetShardMetrics(ctx context.Context, runID string) ([]ShardMetric, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT run_id, node, role, samples,
+		        utilization_avg_pct, utilization_peak_pct,
+		        memory_avg_gib, memory_peak_gib,
+		        sm_active_avg_pct, sm_active_peak_pct,
+		        tensor_active_avg_pct, tensor_active_peak_pct,
+		        dram_active_avg_pct, dram_active_peak_pct
+		 FROM benchmark_metrics_by_shard WHERE run_id = $1 ORDER BY id`, runID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query shard metrics: %w", err)
+	}
+	defer rows.Close()
+	var out []ShardMetric
+	for rows.Next() {
+		var s ShardMetric
+		if err := rows.Scan(&s.RunID, &s.Node, &s.Role, &s.Samples,
+			&s.UtilizationAvgPct, &s.UtilizationPeakPct,
+			&s.MemoryAvgGiB, &s.MemoryPeakGiB,
+			&s.SMActiveAvgPct, &s.SMActivePeakPct,
+			&s.TensorActiveAvgPct, &s.TensorActivePeakPct,
+			&s.DRAMActiveAvgPct, &s.DRAMActivePeakPct); err != nil {
+			return nil, fmt.Errorf("scan shard metric: %w", err)
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
 }

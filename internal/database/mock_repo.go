@@ -304,6 +304,15 @@ func (m *MockRepo) PersistMetrics(_ context.Context, runID string, bm *Benchmark
 	return nil
 }
 
+func (m *MockRepo) GetShardMetrics(_ context.Context, runID string) ([]ShardMetric, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if bm, ok := m.metrics[runID]; ok {
+		return bm.Shards, nil
+	}
+	return nil, nil
+}
+
 func (m *MockRepo) GetBenchmarkRun(_ context.Context, runID string) (*BenchmarkRun, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -567,6 +576,8 @@ func (m *MockRepo) GetRunExportDetails(_ context.Context, runID string) (*RunExp
 		MaxModelLen:            run.MaxModelLen,
 		MaxNumBatchedTokens:    run.MaxNumBatchedTokens,
 		KVCacheDtype:           run.KVCacheDtype,
+		ChunkedPrefillSize:     run.ChunkedPrefillSize,
+		MemFractionStatic:      run.MemFractionStatic,
 		StreamerMode:           run.StreamerMode,
 		StreamerConcurrency:    run.StreamerConcurrency,
 		StreamerMemoryLimitGiB: run.StreamerMemoryLimitGiB,
@@ -577,6 +588,28 @@ func (m *MockRepo) GetRunExportDetails(_ context.Context, runID string) (*RunExp
 		AcceleratorMemoryGiB:   inst.AcceleratorMemoryGiB,
 		VCPUs:                  inst.VCPUs,
 		MemoryGiB:              inst.MemoryGiB,
+		// PRD-59: distributed topology for the manifest export.
+		DeploymentMode:         run.DeploymentMode,
+		NodeCount:              run.NodeCount,
+		PipelineParallelDegree: run.PipelineParallelDegree,
+		NetworkMode:            run.NetworkMode,
+		PrefillReplicas:        run.PrefillReplicas,
+		PrefillTP:              run.PrefillTP,
+		DecodeReplicas:         run.DecodeReplicas,
+		DecodeTP:               run.DecodeTP,
+		// PRD-63/64/61: both pool, per-role scheduler override, EPP routing config
+		// — so an exported manifest reproduces exactly what was applied.
+		BothReplicas:               run.BothReplicas,
+		BothTP:                     run.BothTP,
+		PrefillMaxNumBatchedTokens: run.PrefillMaxNumBatchedTokens,
+		DecodeMaxNumBatchedTokens:  run.DecodeMaxNumBatchedTokens,
+		BothMaxNumBatchedTokens:    run.BothMaxNumBatchedTokens,
+		PDNonCachedTokens:          run.PDNonCachedTokens,
+		PDPrefixCacheWeight:        run.PDPrefixCacheWeight,
+		PDQueueScorerWeight:        run.PDQueueScorerWeight,
+		PDMaxPrefixBlocks:          run.PDMaxPrefixBlocks,
+		PDLRUCapacityPerServer:     run.PDLRUCapacityPerServer,
+		PDDeciderStrategy:          run.PDDeciderStrategy,
 	}
 	// Resolve the streamer-on decision, same as Repository.GetRunExportDetails.
 	mode := ""
@@ -1454,6 +1487,8 @@ func (m *MockRepo) GetToolVersions(_ context.Context) (*ToolVersions, error) {
 			FrameworkVersion:     "v0.19.0",
 			SGLangVersion:        "v0.4.10.post2-cu126",
 			InferencePerfVersion: "v0.2.0",
+			LLMDVersion:          "v0.8.1",
+			PDVLLMVersion:        "v0.25.0",
 			UpdatedAt:            time.Now(),
 		}, nil
 	}

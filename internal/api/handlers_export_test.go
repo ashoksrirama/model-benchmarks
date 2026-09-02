@@ -222,3 +222,215 @@ func TestGenerateManifest_StreamerOff(t *testing.T) {
 		t.Errorf("streamer-off export missing model S3 URI:\n%s", out)
 	}
 }
+
+// TestGenerateManifest_DisaggregatedReproducesAppliedConfig (PRD-61/64): the
+// exported disaggregated manifest must reproduce what was APPLIED for the run —
+// the user's EPP routing overrides AND per-role scheduler overrides — not fixed
+// defaults.
+func TestGenerateManifest_DisaggregatedReproducesAppliedConfig(t *testing.T) {
+	mode := "disaggregated"
+	nc := 128
+	pcw, qsw, mpb, lru := 5, 3, 512, 99999
+	pR, pTP, dR, dTP := 1, 1, 1, 1
+	pMax, dMax := 16384, 2048
+	net := "tcp"
+	d := &database.RunExportDetails{
+		RunID:                "pd-run",
+		ModelHfID:            "Qwen/Qwen2.5-1.5B-Instruct",
+		InstanceTypeName:     "g6.2xlarge",
+		Framework:            "llm-d",
+		TensorParallelDegree: 1,
+		MaxModelLen:          4096,
+		AcceleratorType:      "gpu",
+		AcceleratorName:      "L4",
+		AcceleratorCount:     1,
+		AcceleratorMemoryGiB: 24,
+		VCPUs:                8,
+		MemoryGiB:            32,
+		DeploymentMode:       &mode,
+		NetworkMode:          &net,
+		PrefillReplicas:      &pR,
+		PrefillTP:            &pTP,
+		DecodeReplicas:       &dR,
+		DecodeTP:             &dTP,
+		// PRD-64 per-role scheduler overrides.
+		PrefillMaxNumBatchedTokens: &pMax,
+		DecodeMaxNumBatchedTokens:  &dMax,
+		// PRD-61 routing config.
+		PDNonCachedTokens:      &nc,
+		PDPrefixCacheWeight:    &pcw,
+		PDQueueScorerWeight:    &qsw,
+		PDMaxPrefixBlocks:      &mpb,
+		PDLRUCapacityPerServer: &lru,
+	}
+	out, err := generateManifest(d)
+	if err != nil {
+		t.Fatalf("generateManifest: %v", err)
+	}
+	// PRD-61 routing config as applied (NOT the defaults 16/2/1/256/31250).
+	for _, want := range []string{
+		"nonCachedTokens: 128",
+		"maxPrefixBlocksToMatch: 512",
+		"lruCapacityPerServer: 99999",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("export missing applied routing value %q", want)
+		}
+	}
+	if n := strings.Count(out, "weight: 5"); n != 2 {
+		t.Errorf("applied prefix-cache weight 5 should appear in both profiles (2), got %d", n)
+	}
+	// PRD-64 per-role scheduler: prefill 16384, decode 2048 both present.
+	if !strings.Contains(out, `"16384"`) || !strings.Contains(out, `"2048"`) {
+		t.Errorf("export missing per-role max-num-batched-tokens (16384 prefill / 2048 decode)")
+	}
+	// The shipped defaults must NOT leak in.
+	if strings.Contains(out, "nonCachedTokens: 16\n") {
+		t.Error("export used default nonCachedTokens instead of the applied 128")
+	}
+}
+
+// TestGenerateManifest_DisaggregatedBothPool_ReproducesAppliedConfig (PRD-63/64):
+// a D/P run WITH a co-located "both" pool exports the both role + its per-role
+// scheduler override, and — because a both pool is present — the anti-self-route
+// prefill-only-filter. Covers the both-pool topology with user-supplied values.
+func TestGenerateManifest_DisaggregatedBothPool_ReproducesAppliedConfig(t *testing.T) {
+	mode := "disaggregated"
+	net := "tcp"
+	pR, pTP := 1, 1
+	bR, bTP := 2, 1
+	bMax := 6144 // distinct from max-model-len so the assertion is unambiguous
+	d := &database.RunExportDetails{
+		RunID:                "pd-both-run",
+		ModelHfID:            "Qwen/Qwen2.5-1.5B-Instruct",
+		InstanceTypeName:     "g6.2xlarge",
+		Framework:            "llm-d",
+		TensorParallelDegree: 1,
+		MaxModelLen:          4096,
+		AcceleratorType:      "gpu",
+		AcceleratorName:      "L4",
+		AcceleratorCount:     1,
+		VCPUs:                8,
+		MemoryGiB:            32,
+		DeploymentMode:       &mode,
+		NetworkMode:          &net,
+		// prefill + both (decode covered by the both pool) — a valid PRD-63 combo.
+		PrefillReplicas:         &pR,
+		PrefillTP:               &pTP,
+		BothReplicas:            &bR,
+		BothTP:                  &bTP,
+		BothMaxNumBatchedTokens: &bMax,
+	}
+	out, err := generateManifest(d)
+	if err != nil {
+		t.Fatalf("generateManifest: %v", err)
+	}
+	// The both role Deployment + its canonical wire label render.
+	for _, want := range []string{
+		"pd-qwen-qwen2-5-1-5b-instruct-both",
+		"llm-d.ai/role: prefill-decode",
+		// PRD-63 anti-self-route filter is present because a both pool exists.
+		"prefill-only-filter",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("both-pool export missing %q", want)
+		}
+	}
+	// The both role's per-role --max-num-batched-tokens override (6144) is applied.
+	// (Shared MaxNumBatchedTokens is nil, so this flag appears ONLY via the both
+	// override — an unambiguous check.)
+	if !strings.Contains(out, "--max-num-batched-tokens") || !strings.Contains(out, `"6144"`) {
+		t.Error("both-pool export missing the applied both_max_num_batched_tokens=6144")
+	}
+}
+
+// TestGenerateManifest_SGLangSingleNode_ReproducesAppliedConfig: an SGLang
+// single-node run must export an SGLang manifest (image + sglang.launch_server)
+// carrying the user-supplied vLLM-equivalent knobs AND the SGLang-specific
+// scheduler knobs (--chunked-prefill-size / --mem-fraction-static) — NOT a vLLM
+// manifest. Reuses the runtime BuildArgs so the flags match what ran.
+func TestGenerateManifest_SGLangSingleNode_ReproducesAppliedConfig(t *testing.T) {
+	cp := 4096
+	mf := 0.85
+	q := "fp8"
+	d := &database.RunExportDetails{
+		RunID:                "sgl-run",
+		ModelHfID:            "meta-llama/Llama-3.1-8B-Instruct",
+		InstanceTypeName:     "g6.2xlarge",
+		Framework:            "sglang",
+		FrameworkVersion:     "v0.4.1",
+		TensorParallelDegree: 2,
+		MaxModelLen:          8192,
+		Quantization:         &q,
+		ChunkedPrefillSize:   &cp,
+		MemFractionStatic:    &mf,
+		AcceleratorType:      "gpu",
+		AcceleratorName:      "L4", // non-Hopper → triton backend
+		AcceleratorCount:     2,
+		VCPUs:                8,
+		MemoryGiB:            32,
+	}
+	out, err := generateManifest(d)
+	if err != nil {
+		t.Fatalf("generateManifest: %v", err)
+	}
+	// SGLang image + launcher, NOT vLLM.
+	if !strings.Contains(out, "lmsysorg/sglang:v0.4.1") {
+		t.Error("SGLang export must use the sglang image")
+	}
+	if strings.Contains(out, "vllm/vllm-openai") {
+		t.Error("SGLang export must NOT use the vLLM image")
+	}
+	if !strings.Contains(out, "sglang.launch_server") {
+		t.Error("SGLang export must launch sglang.launch_server")
+	}
+	// Applied knobs (vLLM-equivalent + SGLang-specific).
+	for _, want := range []string{
+		`"--tp-size"`, `"2"`,
+		`"--context-length"`, `"8192"`,
+		`"--chunked-prefill-size"`, `"4096"`,
+		`"--mem-fraction-static"`, `"0.85"`,
+		`"--quantization"`, `"fp8"`,
+		`"--attention-backend"`, `"triton"`, // L4 = non-Hopper
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("SGLang export missing applied flag %q", want)
+		}
+	}
+	// Container named sglang; still a plain single-node Deployment (no llm-d graph).
+	if !strings.Contains(out, "- name: sglang") {
+		t.Error("SGLang container should be named sglang")
+	}
+	if strings.Contains(out, "kind: LeaderWorkerSet") || strings.Contains(out, "kind: InferencePool") {
+		t.Error("SGLang single-node export must be a plain Deployment")
+	}
+}
+
+// TestGenerateManifest_SGLangNoSchedulerKnobs: an SGLang run that set no
+// scheduler knobs omits --chunked-prefill-size / --mem-fraction-static (they're
+// optional; absence = SGLang default).
+func TestGenerateManifest_SGLangNoSchedulerKnobs(t *testing.T) {
+	d := &database.RunExportDetails{
+		ModelHfID:            "meta-llama/Llama-3.1-8B-Instruct",
+		InstanceTypeName:     "g6.2xlarge",
+		Framework:            "sglang",
+		FrameworkVersion:     "v0.4.1",
+		TensorParallelDegree: 1,
+		AcceleratorType:      "gpu",
+		AcceleratorName:      "H100", // Hopper → no forced triton backend
+		AcceleratorCount:     1,
+		VCPUs:                8,
+		MemoryGiB:            32,
+	}
+	out, err := generateManifest(d)
+	if err != nil {
+		t.Fatalf("generateManifest: %v", err)
+	}
+	if strings.Contains(out, "--chunked-prefill-size") || strings.Contains(out, "--mem-fraction-static") {
+		t.Error("unset SGLang scheduler knobs should not render")
+	}
+	// Hopper keeps SGLang's default backend (no forced triton).
+	if strings.Contains(out, "--attention-backend") {
+		t.Error("Hopper GPU should not force the triton attention backend")
+	}
+}

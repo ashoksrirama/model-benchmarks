@@ -123,6 +123,11 @@ type RunExportDetails struct {
 	// KVCacheDtype emits --kv-cache-dtype when non-nil; typically "fp8"
 	// on FP8-capable accelerators, empty otherwise.
 	KVCacheDtype *string
+	// SGLang scheduler knobs (null on vLLM/neuron + historical runs). Captured
+	// so an SGLang single-node export reproduces --chunked-prefill-size /
+	// --mem-fraction-static that were actually applied.
+	ChunkedPrefillSize *int
+	MemFractionStatic  *float64
 	// PRD-50: Run:ai streamer knobs. Null for historical runs (treated
 	// as auto / 16 / auto-sized). UseRunaiStreamer is the resolved
 	// decision — equivalent to `StreamerMode != "off" && ModelS3URI != ""`,
@@ -141,6 +146,49 @@ type RunExportDetails struct {
 	AcceleratorMemoryGiB int
 	VCPUs                int
 	MemoryGiB            int
+	// PRD-59: distributed topology so the exported manifest reproduces a
+	// multi-node / disaggregated run correctly (not a wrong single-node
+	// Deployment). Null on single-instance runs → the single-node manifest path.
+	DeploymentMode         *string
+	NodeCount              *int
+	PipelineParallelDegree *int
+	NetworkMode            *string
+	PrefillReplicas        *int
+	PrefillTP              *int
+	DecodeReplicas         *int
+	DecodeTP               *int
+	// PRD-63: co-located "both" pool, so the exported manifest reproduces a
+	// run that used a both pool (or a both-only run). Null on PD-only runs.
+	BothReplicas *int
+	BothTP       *int
+	// PRD-64: per-role scheduler override, so the export reproduces the
+	// per-role --max-num-batched-tokens actually applied. Null ⇒ role used the
+	// shared MaxNumBatchedTokens.
+	PrefillMaxNumBatchedTokens *int
+	DecodeMaxNumBatchedTokens  *int
+	BothMaxNumBatchedTokens    *int
+	// PRD-61: the run's EPP routing config, so the exported EPP ConfigMap matches
+	// what was applied (user overrides included). Null ⇒ the shipped default was
+	// used; the export applies the same default the orchestrator would.
+	PDNonCachedTokens      *int
+	PDPrefixCacheWeight    *int
+	PDQueueScorerWeight    *int
+	PDMaxPrefixBlocks      *int
+	PDLRUCapacityPerServer *int
+	PDDeciderStrategy      *string
+	// PRD-66 Part 2: configured multi-node image tags, injected by the export
+	// handler from tool_versions (NOT persisted per-run — the tag is a
+	// platform setting, and llm-d/pd-vLLM versions aren't the run's
+	// framework_version). Empty ⇒ the generator falls back to the shipped
+	// default, so the export stays byte-identical to today for callers that
+	// don't set them.
+	LLMDVersion   string
+	PDVLLMVersion string
+	// ModelSizeBytes is the cached model's size, injected by the export handler
+	// (resolveExportStreamer) to derive the Run:ai streamer concurrency exactly
+	// as the orchestrator does (size-derived on high-bandwidth instances).
+	// 0 = unknown → the profile default concurrency.
+	ModelSizeBytes int64
 }
 
 // GetRunExportDetails returns the information needed to export a run's
@@ -154,9 +202,17 @@ func (r *Repository) GetRunExportDetails(ctx context.Context, runID string) (*Ru
 			br.framework, br.framework_version,
 			br.tensor_parallel_degree, br.quantization, br.max_model_len,
 			br.max_num_batched_tokens, br.kv_cache_dtype, br.concurrency,
+			br.chunked_prefill_size, br.mem_fraction_static,
 			br.streamer_mode, br.streamer_concurrency, br.streamer_memory_limit_gib,
 			it.accelerator_type, it.accelerator_name, it.accelerator_count, it.accelerator_memory_gib,
-			it.vcpus, it.memory_gib
+			it.vcpus, it.memory_gib,
+			br.deployment_mode, br.node_count, br.pipeline_parallel_degree, br.network_mode,
+			br.prefill_replicas, br.prefill_tp, br.decode_replicas, br.decode_tp,
+			br.both_replicas, br.both_tp,
+			br.prefill_max_num_batched_tokens, br.decode_max_num_batched_tokens,
+			br.both_max_num_batched_tokens,
+			br.pd_noncached_tokens, br.pd_prefix_cache_weight, br.pd_queue_scorer_weight,
+			br.pd_max_prefix_blocks, br.pd_lru_capacity_per_server, br.pd_decider_strategy
 		FROM benchmark_runs br
 		JOIN models m ON br.model_id = m.id
 		JOIN instance_types it ON br.instance_type_id = it.id
@@ -166,9 +222,16 @@ func (r *Repository) GetRunExportDetails(ctx context.Context, runID string) (*Ru
 		&d.Framework, &d.FrameworkVersion,
 		&d.TensorParallelDegree, &d.Quantization, &maxModelLen,
 		&d.MaxNumBatchedTokens, &d.KVCacheDtype, &d.Concurrency,
+		&d.ChunkedPrefillSize, &d.MemFractionStatic,
 		&d.StreamerMode, &d.StreamerConcurrency, &d.StreamerMemoryLimitGiB,
 		&d.AcceleratorType, &d.AcceleratorName, &d.AcceleratorCount, &d.AcceleratorMemoryGiB,
 		&d.VCPUs, &d.MemoryGiB,
+		&d.DeploymentMode, &d.NodeCount, &d.PipelineParallelDegree, &d.NetworkMode,
+		&d.PrefillReplicas, &d.PrefillTP, &d.DecodeReplicas, &d.DecodeTP,
+		&d.BothReplicas, &d.BothTP,
+		&d.PrefillMaxNumBatchedTokens, &d.DecodeMaxNumBatchedTokens, &d.BothMaxNumBatchedTokens,
+		&d.PDNonCachedTokens, &d.PDPrefixCacheWeight, &d.PDQueueScorerWeight,
+		&d.PDMaxPrefixBlocks, &d.PDLRUCapacityPerServer, &d.PDDeciderStrategy,
 	)
 	if err != nil {
 		if err.Error() == "no rows in result set" {

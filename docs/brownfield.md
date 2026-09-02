@@ -19,7 +19,7 @@ EC2NodeClasses that benchmark pods actually schedule onto.
 
 The cluster you're installing into must meet these requirements:
 
-- **EKS ≥ 1.31.** Older versions may work but aren't tested.
+- **EKS ≥ 1.31.** Tested on 1.36 (the greenfield default). Older versions may work but aren't tested.
 - **Karpenter ≥ v1.9** if you plan to reuse the existing controller
   (`install_karpenter_controller = false`). Our NodePool manifests
   use `disruption.budgets`, `consolidationPolicy`, and
@@ -45,8 +45,10 @@ The cluster you're installing into must meet these requirements:
 Even in brownfield mode, the following are created by our Terraform
 and managed by AccelBench:
 
-- **Karpenter NodePools** (`general-purpose`, `gpu`, `neuron`) and
-  their **EC2NodeClasses**. These carry a dedicated taint
+- **Karpenter NodePools** (`general-purpose`, `gpu`, `neuron`, and — when
+  `enable_multinode=true` — the per-AZ `multinode-<az>` EFA pools) and their
+  **EC2NodeClasses** (incl. the shared `multinode-tcp` class for non-EFA
+  distributed runs). These carry a dedicated taint
   (`accelbench.io/dedicated=true:NoSchedule`) so benchmark pods only
   land on our nodes and your pods never do. `weight: 100` on each
   NodePool ensures Karpenter picks ours over any operator NodePools
@@ -79,12 +81,23 @@ already has them:
 | `install_karpenter_controller` | `true` | Cluster already runs Karpenter ≥ v1.9. |
 | `install_alb_controller` | `true` | Cluster already runs `aws-load-balancer-controller`. |
 | `install_nvidia_device_plugin` | `true` | Cluster already runs the NVIDIA device plugin DaemonSet. |
-| `manage_pull_through_cache` | `true` | You don't need a Docker Hub pull-through cache (e.g. you're using a public-ECR vLLM image via `image.vllm.repository` — see [`deployment.md`](deployment.md)). |
+| `manage_pull_through_cache` | `true` | You don't need the ECR pull-through cache (Docker Hub for vLLM + GHCR for the llm-d-aws PP image) — e.g. you're using a public-ECR vLLM image via `image.vllm.repository` (see [`deployment.md`](deployment.md)) and not running multi-node PP. |
 | `auth_enabled` | `true` | You want to run without Cognito. See [`deployment.md`](deployment.md#disabling-in-app-authentication). |
 
 The Pod Identity agent and EBS CSI driver don't have dedicated
 toggles — they come with our EKS module in greenfield and are
 assumed pre-existing in brownfield (they're prerequisites).
+
+When `install_karpenter_controller = false`, Terraform looks up the
+existing controller's Deployment to confirm its version is ≥ v1.9.
+Two optional variables tell Terraform where to find it:
+
+| Variable | Default | Set when |
+|---|---|---|
+| `karpenter_namespace` | `kube-system` | Operator installed Karpenter in a different namespace (e.g. `karpenter`). |
+| `karpenter_release_name` | `karpenter` | Operator installed Karpenter under a different Helm release name. |
+
+Confirm the right values with `kubectl get deploy -A | grep karpenter`.
 
 ## Setup
 
@@ -103,7 +116,8 @@ Run these to verify your cluster meets the prerequisites:
 ```bash
 kubectl config current-context                          # confirm you're pointed at the right cluster
 kubectl get daemonset -n kube-system                    # check for pod-identity-agent, ebs-csi-node, nvidia-device-plugin, aws-load-balancer-controller
-kubectl get deployment -n kube-system karpenter -o \
+kubectl get deploy -A | grep karpenter                  # find the namespace + Deployment name (defaults: kube-system / karpenter)
+kubectl get deployment -n <ns> <name> -o \
   jsonpath='{.spec.template.spec.containers[0].image}'  # confirm Karpenter version >= 1.9
 ```
 
@@ -139,6 +153,12 @@ manage_pull_through_cache    = false
 # Docker Hub creds only needed when manage_pull_through_cache = true
 # dockerhub_username     = ""
 # dockerhub_access_token = ""
+
+# GitHub PAT (read:packages) — only for multi-node co-located (PP) runs, which
+# pull the llm-d-aws image through the GHCR pull-through cache. GHCR requires
+# auth even for public images. Omit if you only run single-node or D/P.
+# github_username = ""
+# github_token    = ""
 
 # Auth: leave enabled for multi-tenant, or set false for lab clusters
 auth_enabled                 = true
@@ -228,7 +248,9 @@ For a public URL, configure `ingress_mode` per the main
 
 ## How the coexistence safety works
 
-The three AccelBench NodePools apply a **dedicated taint**:
+Every AccelBench NodePool (`general-purpose`, `gpu`, `neuron`, and the
+`multinode-<az>` pools when multi-node is enabled) applies a **dedicated
+taint**:
 
 ```yaml
 taints:
@@ -326,10 +348,21 @@ Capacity Block for ML to a NodePool, see the Configuration page)
 targets our EC2NodeClasses via the
 `capacityReservationSelectorTerms` field. This requires AccelBench
 to own the NodeClasses, which it does in both greenfield and
-brownfield modes. Operators don't need to — and can't — attach
-reservations to their existing NodePools through AccelBench's UI.
+brownfield modes. The panel covers the `gpu`, `neuron`, and per-AZ
+`multinode-<az>` classes; since a reservation is AZ-scoped, a
+multi-node pool's reservation must be in that pool's AZ. Operators
+don't need to — and can't — attach reservations to their existing
+NodePools through AccelBench's UI.
 
 ## Troubleshooting
+
+**`terraform plan` fails with "Could not find Karpenter Deployment..."**
+: Terraform looked up the Karpenter Deployment in
+  `karpenter_namespace` / `karpenter_release_name` and got back
+  nothing. Run `kubectl get deploy -A | grep karpenter` to find the
+  actual location, then set those two variables to match. Or set
+  `install_karpenter_controller = true` to skip the lookup and have
+  Terraform install Karpenter itself.
 
 **`terraform plan` fails with "Karpenter version..."**
 : Your installed Karpenter is older than v1.9. Either upgrade the

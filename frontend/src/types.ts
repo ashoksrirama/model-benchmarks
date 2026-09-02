@@ -48,6 +48,36 @@ export interface BenchmarkRun {
   framework: string;
   framework_version: string;
   tensor_parallel_degree: number;
+  // PRD-57: distributed-run topology (null on single-instance runs).
+  deployment_mode?: string | null;          // "single" | "distributed" | "disaggregated"
+  node_count?: number | null;
+  pipeline_parallel_degree?: number | null;  // PP across nodes
+  network_mode?: string | null;              // "efa" | "tcp"
+  // PRD-58: prefill/decode disaggregation (null unless deployment_mode is
+  // "disaggregated"). Per-role replica counts + within-node TP; KV describes
+  // the transfer connector/backend.
+  prefill_replicas?: number | null;
+  prefill_tp?: number | null;
+  prefill_pp?: number | null;
+  decode_replicas?: number | null;
+  decode_tp?: number | null;
+  decode_pp?: number | null;
+  // PRD-63: co-located "both" pool. Null unless the run set a both pool.
+  both_replicas?: number | null;
+  both_tp?: number | null;
+  kv_connector?: string | null;
+  kv_transfer_backend?: string | null;
+  // PRD-64/63: per-role scheduler override. Null ⇒ role used the shared value.
+  prefill_max_num_batched_tokens?: number | null;
+  decode_max_num_batched_tokens?: number | null;
+  both_max_num_batched_tokens?: number | null;
+  // PRD-61: EPP routing config (disaggregated only). Null ⇒ shipped default used.
+  pd_noncached_tokens?: number | null;
+  pd_prefix_cache_weight?: number | null;
+  pd_queue_scorer_weight?: number | null;
+  pd_max_prefix_blocks?: number | null;
+  pd_lru_capacity_per_server?: number | null;
+  pd_decider_strategy?: string | null;
   quantization?: string;
   concurrency: number;
   input_sequence_length: number;
@@ -136,6 +166,44 @@ export interface BenchmarkMetrics {
   dram_active_peak_pct?: number;
   // Average framebuffer usage (GiB) across scrapes.
   accelerator_memory_avg_gib?: number;
+  // PRD-59: honest group GPU memory total (sum of per-node peaks) for
+  // distributed runs; undefined on single-instance runs.
+  accelerator_memory_total_gib?: number;
+  // PRD-59: per-node/per-role GPU breakdown for distributed runs; empty/absent
+  // for single-instance runs.
+  shards?: ShardMetric[];
+  // PRD-62: disaggregation / KV-transfer / EPP-routing run-level summaries.
+  // Present only on disaggregated runs where the series populated; undefined
+  // otherwise (render as "not collected").
+  kv_transfer_time_avg_ms?: number;
+  kv_transfer_bytes_total?: number;
+  kv_transfer_failures?: number;
+  prefill_time_server_avg_ms?: number;
+  decode_time_server_avg_ms?: number;
+  external_prefix_cache_hit_rate?: number;
+  disagg_prefill_decode_count?: number;
+  disagg_decode_only_count?: number;
+  disagg_engaged_rate_pct?: number;
+  pool_kv_cache_util_pct?: number;
+  pool_queue_size_avg?: number;
+}
+
+// PRD-59: one serving shard's ({node, role}) GPU telemetry (distributed runs).
+export interface ShardMetric {
+  run_id: string;
+  node: string;
+  role?: string; // "" co-located | "prefill" | "decode"
+  samples: number;
+  utilization_avg_pct?: number;
+  utilization_peak_pct?: number;
+  memory_avg_gib?: number;
+  memory_peak_gib?: number;
+  sm_active_avg_pct?: number;
+  sm_active_peak_pct?: number;
+  tensor_active_avg_pct?: number;
+  tensor_active_peak_pct?: number;
+  dram_active_avg_pct?: number;
+  dram_active_peak_pct?: number;
 }
 
 export interface RunRequest {
@@ -164,6 +232,35 @@ export interface RunRequest {
   streamer_mode?: string;            // "" | "auto" | "off"
   streamer_concurrency?: number;     // 0 = default (16)
   streamer_memory_limit_gib?: number; // 0 = auto-sized
+  // PRD-57: distributed (multi-node) topology. Omit / "single" = single-instance.
+  deployment_mode?: string;          // "" | "single" | "distributed" | "disaggregated"
+  node_count?: number;               // LWS group size (distributed)
+  pipeline_parallel_degree?: number; // PP across nodes (== node_count)
+  network_mode?: string;             // "efa" (default) | "tcp"
+  // PRD-58: prefill/decode disaggregation (set only when deployment_mode is
+  // "disaggregated"). Per-role replica counts (the xPyD ratio) + within-node TP.
+  prefill_replicas?: number;
+  prefill_tp?: number;
+  prefill_pp?: number;
+  decode_replicas?: number;
+  decode_tp?: number;
+  decode_pp?: number;
+  // PRD-63: optional co-located "both" pool (prefill+decode fused).
+  both_replicas?: number;
+  both_tp?: number;
+  // PRD-64/63: optional per-role scheduler override (D/P only). 0/undefined ⇒
+  // inherit the shared max_num_batched_tokens.
+  prefill_max_num_batched_tokens?: number;
+  decode_max_num_batched_tokens?: number;
+  both_max_num_batched_tokens?: number;
+  // PRD-61: optional EPP routing config (disaggregated only). Omitted ⇒ default.
+  // pd_noncached_tokens: 0 is meaningful (disable PD) — send only when user set it.
+  pd_noncached_tokens?: number;
+  pd_prefix_cache_weight?: number;
+  pd_queue_scorer_weight?: number;
+  pd_max_prefix_blocks?: number;
+  pd_lru_capacity_per_server?: number;
+  pd_decider_strategy?: string;
 }
 
 export interface RunListItem {
@@ -194,6 +291,9 @@ export interface Job {
   created_at: string;
   started_at?: string;
   completed_at?: string;
+  // PRD-57: distributed-run topology for the Runs list. Null on single-instance.
+  deployment_mode?: string; // "" | "single" | "distributed"
+  node_count?: number;
 }
 
 export interface JobFilter {
@@ -656,6 +756,8 @@ export interface CredentialMetadata {
 export interface CredentialsStatus {
   hf_token: CredentialMetadata;
   dockerhub_token: CredentialMetadata;
+  // PRD-66 Part 2a: GitHub Container Registry token (llm-d-aws pull-through).
+  ghcr_token: CredentialMetadata;
 }
 
 // PRD-32: catalog matrix editor
@@ -670,6 +772,11 @@ export interface ToolVersions {
   framework_version: string;
   sglang_version: string;
   inference_perf_version: string;
+  // PRD-66 Part 2: settable multi-node image tags. llmd_version is the
+  // co-located PP image (llm-d-aws); pd_vllm_version is the disaggregated
+  // D/P image (vllm/vllm-openai) — distinct from framework_version.
+  llmd_version: string;
+  pd_vllm_version: string;
   updated_at: string;
   env_override_active: boolean;
   env_override_image?: string;
@@ -680,6 +787,13 @@ export interface ToolVersions {
   // SGLANG_IMAGE env var status (mirror of VLLM_IMAGE for SGLang runs).
   sglang_env_override_active: boolean;
   sglang_env_override_image?: string;
+  // PRD-66 Part 2: LLMD_IMAGE / PD_MODEL_IMAGE env var status (both fall
+  // back to VLLM_IMAGE in the runtime). When active, the corresponding
+  // version is still saved but the orchestrator ignores it at runtime.
+  llmd_env_override_active: boolean;
+  llmd_env_override_image?: string;
+  pd_vllm_env_override_active: boolean;
+  pd_vllm_env_override_image?: string;
 }
 
 export interface CatalogModelEntry {
@@ -770,6 +884,7 @@ export interface NodePoolReservations {
   node_class: string;
   node_pool: string;
   instance_families: string[];
+  instance_categories: string[]; // set instead of families for the multinode pools (PRD-66)
   subnet_azs: string[];
   capacity_type_includes_reserved: boolean;
   reservations: ReservationSummary[];

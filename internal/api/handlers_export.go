@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net/http"
 	"os"
@@ -9,10 +10,387 @@ import (
 	"text/template"
 
 	"github.com/accelbench/accelbench/internal/database"
+	"github.com/accelbench/accelbench/internal/manifest"
+	"github.com/accelbench/accelbench/internal/orchestrator"
 	"github.com/accelbench/accelbench/internal/report"
+	"github.com/accelbench/accelbench/internal/runtime"
 	"github.com/accelbench/accelbench/internal/scenario"
 	"github.com/accelbench/accelbench/internal/testsuite"
 )
+
+// Small nil-deref helpers for building runtime ContainerParams from the
+// pointer-typed RunExportDetails fields.
+func derefStrExport(p *string) string {
+	if p != nil {
+		return *p
+	}
+	return ""
+}
+func derefIntExport(p *int) int {
+	if p != nil {
+		return *p
+	}
+	return 0
+}
+func derefFloatExport(p *float64) float64 {
+	if p != nil {
+		return *p
+	}
+	return 0
+}
+
+// PRD-59: export-side mirrors of the orchestrator's distributed deploy
+// constants (unexported there). Kept in sync so an exported manifest matches
+// what a fresh distributed run would deploy. If these drift, the export is
+// still apply-able — it just may name a different gateway/pool.
+const (
+	exportGatewayName      = "accelbench-gateway"
+	exportGatewayNamespace = "envoy-gateway-system"
+	exportGPUDeviceClass   = "gpu.nvidia.com"
+	exportEFADeviceClass   = "efa.networking.k8s.aws"
+	exportMultiNodeTaintK  = "accelbench.io/multinode"
+	exportMultiNodeTaintV  = "true"
+	exportDRASelectorK     = "accelbench.io/dra"
+	exportDRASelectorV     = "true"
+	exportPDSidecarImage   = "ghcr.io/llm-d/llm-d-router-disagg-sidecar:v0.9.0"
+	exportPDEPPImage       = "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0"
+	exportPDNixlModuleDir  = "/usr/local/lib/python3.12/dist-packages/nixl_cu13.libs/ucx"
+	exportPDNonCachedToken = 16
+	// PRD-61: EPP routing defaults, mirroring the orchestrator's defaultPD*
+	// (internal/orchestrator/disaggregated.go). Applied when a run's pd_* column
+	// is NULL, so the exported EPP config matches the shipped default the run used.
+	exportPDPrefixCacheWeight = 2
+	exportPDQueueScorerWeight = 1
+	exportPDMaxPrefixBlocks   = 256
+	exportPDLRUCapacity       = 31250
+)
+
+// derefPtr returns *p when p is non-nil (PRESERVING 0), else def. Unlike the
+// local deref (which floors non-positive to def), this is for values where 0 is
+// meaningful — e.g. pd_noncached_tokens=0 (disable disaggregation).
+func derefPtr(p *int, def int) int {
+	if p != nil {
+		return *p
+	}
+	return def
+}
+
+// sanitizeDNS1123 turns a model id into a DNS-1123-label-safe name (lowercase
+// alnum + '-', no dots, no leading/trailing dashes, <=63 chars) for use as a
+// Kubernetes resource name / label value. sanitizeFilename is NOT sufficient —
+// it leaves dots (e.g. "qwen2.5"), which k8s object names reject.
+func sanitizeDNS1123(modelID string) string {
+	var b strings.Builder
+	prevDash := false
+	for _, r := range strings.ToLower(modelID) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			prevDash = false
+		default:
+			if !prevDash && b.Len() > 0 {
+				b.WriteByte('-')
+				prevDash = true
+			}
+		}
+	}
+	s := strings.Trim(b.String(), "-")
+	if len(s) > 55 { // leave headroom for suffixes like "-prefill-devices"
+		s = strings.Trim(s[:55], "-")
+	}
+	if s == "" {
+		s = "model"
+	}
+	return s
+}
+
+// exportServeArgs builds the model positional + static tuning flags that both
+// llm-d render paths append coordination/TP flags onto — mirroring the llm-d
+// runtime's BuildArgs (model id + --trust-remote-code + optional knobs). Uses the
+// run's shared --max-num-batched-tokens.
+func exportServeArgs(d *database.RunExportDetails, tp int) []string {
+	return exportServeArgsWithBatchTokens(d, d.MaxNumBatchedTokens, tp)
+}
+
+// exportServeArgsWithBatchTokens is exportServeArgs with an explicit
+// --max-num-batched-tokens override — used to build the PRD-64 per-role arg sets
+// so the exported prefill/decode/both Deployments carry the exact per-role
+// scheduler flag that was applied. maxNBT nil/<=0 ⇒ omit the flag (vLLM default).
+func exportServeArgsWithBatchTokens(d *database.RunExportDetails, maxNBT *int, tp int) []string {
+	// PRD-65 Layer 4: when the run streamed from S3 (Run:ai), the model arg is
+	// the S3 URI + --load-format runai_streamer + --model-loader-extra-config.
+	// The extra-config JSON is built by the SAME runtime.StreamerExtraConfig the
+	// orchestrator's BuildArgs uses (concurrency, distributed for TP>1,
+	// memory_limit) so the export can't drift from what deployed. Otherwise the
+	// HF model id (unchanged). resolveExportStreamer scopes UseRunaiStreamer to
+	// D/P, so PP never takes this branch.
+	var args []string
+	if d.UseRunaiStreamer && d.ModelS3URI != nil && *d.ModelS3URI != "" {
+		extra := runtime.StreamerExtraConfig(runtime.ContainerParams{
+			UseRunaiStreamer:       true,
+			TensorParallelDegree:   tp,
+			StreamerConcurrency:    derefIntExport(d.StreamerConcurrency),
+			StreamerMemoryLimitGiB: exportStreamerMemLimitGiB(d),
+			ModelSizeBytes:         d.ModelSizeBytes,
+			InstanceTypeName:       d.InstanceTypeName,
+		})
+		args = []string{*d.ModelS3URI, "--load-format", "runai_streamer", "--model-loader-extra-config", extra, "--trust-remote-code"}
+	} else {
+		args = []string{d.ModelHfID, "--trust-remote-code"}
+	}
+	if d.MaxModelLen > 0 {
+		args = append(args, "--max-model-len", fmt.Sprintf("%d", d.MaxModelLen))
+	}
+	if maxNBT != nil && *maxNBT > 0 {
+		args = append(args, "--max-num-batched-tokens", fmt.Sprintf("%d", *maxNBT))
+	}
+	if d.KVCacheDtype != nil && *d.KVCacheDtype != "" {
+		args = append(args, "--kv-cache-dtype", *d.KVCacheDtype)
+	}
+	return args
+}
+
+// exportStreamerMemLimitGiB resolves the D/P streamer memory-limit for export
+// the same way deployLLMDDisaggregated does: the persisted value if set, else
+// auto-size to half the node RAM. Keeps the exported memory_limit + env in sync
+// with what deployed.
+func exportStreamerMemLimitGiB(d *database.RunExportDetails) int {
+	if d.StreamerMemoryLimitGiB != nil && *d.StreamerMemoryLimitGiB > 0 {
+		return *d.StreamerMemoryLimitGiB
+	}
+	return max(d.MemoryGiB/2, 1)
+}
+
+// exportPDStreamerMemLimitGiB is the render-param form: the memory-limit only
+// when the run streamed (else 0 → the template emits no env, byte-identical to
+// an HF-load export).
+func exportPDStreamerMemLimitGiB(d *database.RunExportDetails) int {
+	if d.UseRunaiStreamer && d.ModelS3URI != nil && *d.ModelS3URI != "" {
+		return exportStreamerMemLimitGiB(d)
+	}
+	return 0
+}
+
+// exportPDStreamerChunkBytesize is the render-param form: AWS's 4 GiB chunk env
+// only when the run streamed on a high-bandwidth instance (matching the
+// orchestrator), else "" → the template emits no env (8 MiB streamer default).
+func exportPDStreamerChunkBytesize(d *database.RunExportDetails) string {
+	if d.UseRunaiStreamer && d.ModelS3URI != nil && *d.ModelS3URI != "" {
+		return runtime.StreamerChunkBytesize(d.InstanceTypeName)
+	}
+	return ""
+}
+
+// exportPDModelServiceAccount returns the S3-access service account for a
+// streamed D/P run (matching the orchestrator's modelServiceAccount), else "".
+func exportPDModelServiceAccount(d *database.RunExportDetails) string {
+	if d.UseRunaiStreamer && d.ModelS3URI != nil && *d.ModelS3URI != "" {
+		return "accelbench-model"
+	}
+	return ""
+}
+
+func exportNetworkMode(d *database.RunExportDetails) string {
+	if d.NetworkMode != nil && *d.NetworkMode == "tcp" {
+		return "tcp"
+	}
+	return "efa"
+}
+
+// exportLLMDImageFor resolves the co-located PP image the same way the
+// orchestrator's deploy path does (PRD-66 Part 2): an LLMD_IMAGE / VLLM_IMAGE
+// override wins verbatim; otherwise compose ghcr.io/llm-d/llm-d-aws from the
+// configured LLMDVersion (empty ⇒ shipped default), routed through the GHCR
+// pull-through cache when one is configured (PRD-66 Part 2a). One resolver so
+// the export can't drift from what ran.
+func exportLLMDImageFor(d *database.RunExportDetails) string {
+	rt := &runtime.LLMD{}
+	if ov := rt.ResolveImageOverride(); ov != "" {
+		return ov
+	}
+	return runtime.LLMDImage(d.LLMDVersion, os.Getenv("PULL_THROUGH_REGISTRY"))
+}
+
+// exportPDModelImageFor resolves the D/P vLLM image the same way the
+// orchestrator's deploy path does (PRD-66 Part 2): a VLLM_IMAGE / LLMD_IMAGE
+// override wins verbatim; else a PD_MODEL_IMAGE env var is an exact ref; else
+// compose vllm/vllm-openai from the configured PDVLLMVersion, routed through the
+// Docker Hub pull-through cache when one is set. Shares orchestrator.PDModelImage
+// so deploy + export can't drift.
+func exportPDModelImageFor(d *database.RunExportDetails) string {
+	rt := &runtime.LLMD{}
+	if ov := rt.ResolveImageOverride(); ov != "" {
+		return ov
+	}
+	if pd := os.Getenv("PD_MODEL_IMAGE"); pd != "" {
+		return pd
+	}
+	return orchestrator.PDModelImage(d.PDVLLMVersion, os.Getenv("PULL_THROUGH_REGISTRY"))
+}
+
+// generateDistributedManifest renders the co-located multi-node llm-d object
+// graph (LeaderWorkerSet + Service + HTTPRoute + DRA claims) for a distributed
+// run (PRD-56 shape), reusing the orchestrator's renderer (PRD-59 fix — the old
+// path wrongly emitted a single-node Deployment for these runs).
+func generateDistributedManifest(d *database.RunExportDetails) (string, error) {
+	name := "llmd-" + sanitizeDNS1123(d.ModelHfID)
+	nodeCount := 2
+	if d.NodeCount != nil && *d.NodeCount > 0 {
+		nodeCount = *d.NodeCount
+	}
+	pp := nodeCount
+	if d.PipelineParallelDegree != nil && *d.PipelineParallelDegree > 0 {
+		pp = *d.PipelineParallelDegree
+	}
+	gpusPerNode := d.AcceleratorCount
+	tp := d.TensorParallelDegree
+	if tp < 1 {
+		tp = 1
+	}
+	netMode := exportNetworkMode(d)
+	efaPerNode := gpusPerNode
+	if netMode == "tcp" {
+		efaPerNode = 0
+	}
+	return manifest.RenderLLMDDeployment(manifest.LLMDDeploymentParams{
+		Name:                   name,
+		Namespace:              "accelbench",
+		Image:                  exportLLMDImageFor(d),
+		ServeArgs:              exportServeArgs(d, d.TensorParallelDegree),
+		ContainerName:          "vllm",
+		ModelHfID:              d.ModelHfID,
+		HfToken:                "",
+		InstanceTypeName:       d.InstanceTypeName,
+		NodeCount:              nodeCount,
+		TensorParallelDegree:   tp,
+		PipelineParallelDegree: pp,
+		GPUsPerNode:            gpusPerNode,
+		CPURequest:             fmt.Sprintf("%d", max(d.VCPUs*3/4, 1)),
+		MemoryRequest:          fmt.Sprintf("%dGi", max(d.MemoryGiB*85/100, 1)),
+		NetworkMode:            netMode,
+		GPUDeviceClass:         exportGPUDeviceClass,
+		EFADeviceClass:         exportEFADeviceClass,
+		EFAPerNode:             efaPerNode,
+		GatewayName:            exportGatewayName,
+		GatewayNamespace:       exportGatewayNamespace,
+		MultiNodeTaintKey:      exportMultiNodeTaintK,
+		MultiNodeTaintValue:    exportMultiNodeTaintV,
+		DRANodeSelectorKey:     exportDRASelectorK,
+		DRANodeSelectorVal:     exportDRASelectorV,
+	})
+}
+
+// generateDisaggregatedManifest renders the prefill/decode object graph (two
+// Deployments + InferencePool + EPP) for a disaggregated run (PRD-58 shape).
+func generateDisaggregatedManifest(d *database.RunExportDetails) (string, error) {
+	name := "pd-" + sanitizeDNS1123(d.ModelHfID)
+	deref := func(p *int, def int) int {
+		if p != nil && *p > 0 {
+			return *p
+		}
+		return def
+	}
+	// PRD-63: a role's replica count may legitimately be 0 (a both-only run has
+	// null prefill/decode). derefZero preserves 0 (vs. deref's floor-to-def),
+	// so the exported graph matches the run's actual pool combination.
+	derefZero := func(p *int) int {
+		if p != nil && *p > 0 {
+			return *p
+		}
+		return 0
+	}
+	// Replica counts preserve 0; but if the whole set is empty (all null, e.g. a
+	// historical PD row that predates typed export), fall back to a 1P1D graph.
+	prefillR := derefZero(d.PrefillReplicas)
+	decodeR := derefZero(d.DecodeReplicas)
+	bothR := derefZero(d.BothReplicas)
+	if prefillR == 0 && decodeR == 0 && bothR == 0 {
+		prefillR, decodeR = 1, 1
+	}
+	// PRD-64: reproduce the per-role scheduler override actually applied. The
+	// shared ServeArgs carry the run's shared --max-num-batched-tokens; a role's
+	// arg set is emitted only when that role had an override (matching the
+	// orchestrator, which leaves the per-role sets nil otherwise → template falls
+	// back to shared).
+	prefillTP := deref(d.PrefillTP, 1)
+	decodeTP := deref(d.DecodeTP, 1)
+	bothTP := deref(d.BothTP, 1)
+	// Per-role arg sets: built when a role has a batch-token override OR when
+	// streaming (so each role's distributed:true reflects its own TP), mirroring
+	// deployLLMDDisaggregated. When neither applies the set stays nil and the
+	// template falls back to the shared ServeArgs (byte-identical to pre-PRD-65).
+	streamed := d.UseRunaiStreamer && d.ModelS3URI != nil && *d.ModelS3URI != ""
+	var prefillArgs, decodeArgs, bothArgs []string
+	if (d.PrefillMaxNumBatchedTokens != nil && *d.PrefillMaxNumBatchedTokens > 0) || streamed {
+		prefillArgs = exportServeArgsWithBatchTokens(d, d.PrefillMaxNumBatchedTokens, prefillTP)
+	}
+	if (d.DecodeMaxNumBatchedTokens != nil && *d.DecodeMaxNumBatchedTokens > 0) || streamed {
+		decodeArgs = exportServeArgsWithBatchTokens(d, d.DecodeMaxNumBatchedTokens, decodeTP)
+	}
+	if ((d.BothMaxNumBatchedTokens != nil && *d.BothMaxNumBatchedTokens > 0) || streamed) && bothR > 0 {
+		bothArgs = exportServeArgsWithBatchTokens(d, d.BothMaxNumBatchedTokens, bothTP)
+	}
+	// Resolve the D/P vLLM image the same way the orchestrator's deploy path
+	// does (PRD-66 Part 2): a VLLM_IMAGE / PD_MODEL_IMAGE override wins verbatim;
+	// otherwise compose vllm/vllm-openai from the configured pd_vllm_version and
+	// route through the Docker Hub ECR pull-through cache when one is set — so the
+	// exported manifest reproduces what ran.
+	pdImage := exportPDModelImageFor(d)
+	// PRD-61: reproduce the run's EPP routing config. NULL ⇒ the run used the
+	// shipped default, so the export applies the SAME default the orchestrator
+	// would (deref-to-default), keeping the exported EPP config faithful to what
+	// ran. nonCachedTokens=0 is meaningful (disable PD) and preserved by deref.
+	return manifest.RenderLLMDDisaggregated(manifest.LLMDDisaggregatedParams{
+		Name:                name,
+		Namespace:           "accelbench",
+		Image:               pdImage,
+		ServeArgs:           exportServeArgs(d, prefillTP),
+		PrefillServeArgs:    prefillArgs,
+		DecodeServeArgs:     decodeArgs,
+		BothServeArgs:       bothArgs,
+		ContainerName:       "vllm",
+		ModelHfID:           d.ModelHfID,
+		ModelLabel:          sanitizeDNS1123(d.ModelHfID),
+		HfToken:             "",
+		// PRD-65 Layer 4: reproduce the streamed-load wiring — the S3-access SA
+		// + the streamer tuning env (retry / chunk / memory-limit) — when the run
+		// streamed (D/P cached model).
+		ModelServiceAccount:    exportPDModelServiceAccount(d),
+		UseRunaiStreamer:       d.UseRunaiStreamer && d.ModelS3URI != nil && *d.ModelS3URI != "",
+		StreamerMemoryLimitGiB: exportPDStreamerMemLimitGiB(d),
+		StreamerChunkBytesize:  exportPDStreamerChunkBytesize(d),
+		InstanceTypeName:    d.InstanceTypeName,
+		PrefillReplicas:     prefillR,
+		PrefillTP:           deref(d.PrefillTP, 1),
+		DecodeReplicas:      decodeR,
+		DecodeTP:            deref(d.DecodeTP, 1),
+		BothReplicas:        bothR,
+		BothTP:              deref(d.BothTP, 1),
+		CPURequest:          fmt.Sprintf("%d", max(d.VCPUs*3/4, 1)),
+		MemoryRequest:       fmt.Sprintf("%dGi", max(d.MemoryGiB*85/100, 1)),
+		NetworkMode:         exportNetworkMode(d),
+		NixlModuleDir:       exportPDNixlModuleDir,
+		EPPImage:            exportPDEPPImage,
+		SidecarImage:        exportPDSidecarImage,
+		// nonCachedTokens uses a POINTER deref (0 = disable PD, distinct from unset).
+		NonCachedTokens:         derefPtr(d.PDNonCachedTokens, exportPDNonCachedToken),
+		PrefixCacheScorerWeight: deref(d.PDPrefixCacheWeight, exportPDPrefixCacheWeight),
+		QueueScorerWeight:       deref(d.PDQueueScorerWeight, exportPDQueueScorerWeight),
+		MaxPrefixBlocksToMatch:  deref(d.PDMaxPrefixBlocks, exportPDMaxPrefixBlocks),
+		LRUCapacityPerServer:    deref(d.PDLRUCapacityPerServer, exportPDLRUCapacity),
+		// EPPZone is intentionally left empty: the run's AZ is a runtime capacity
+		// decision (never persisted), and a re-applied manifest picks its own AZ.
+		// Pinning the EPP to this run's AZ would be wrong for a fresh re-apply, so
+		// the exported EPP stays AZ-unconstrained (schedules on any system node).
+		GPUDeviceClass:      exportGPUDeviceClass,
+		GatewayName:         exportGatewayName,
+		GatewayNamespace:    exportGatewayNamespace,
+		MultiNodeTaintKey:   exportMultiNodeTaintK,
+		MultiNodeTaintValue: exportMultiNodeTaintV,
+		DRANodeSelectorKey:  exportDRASelectorK,
+		DRANodeSelectorVal:  exportDRASelectorV,
+	})
+}
 
 // handleExportManifest generates a Kubernetes manifest YAML for deploying
 // the model configuration from a completed benchmark run.
@@ -44,6 +422,11 @@ func (s *Server) handleExportManifest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "run details not found")
 		return
 	}
+	// PRD-66 Part 2: inject the configured multi-node image tags so the exported
+	// manifest names the image that would actually deploy (not a stale hardcode).
+	s.injectMultinodeImageVersions(r.Context(), details)
+	// PRD-65 Layer 4: reproduce the D/P cached-model streamer decision.
+	s.resolveExportStreamer(r.Context(), details)
 
 	// Generate the manifest.
 	manifest, err := generateManifest(details)
@@ -58,6 +441,53 @@ func (s *Server) handleExportManifest(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(manifest))
+}
+
+// resolveExportStreamer makes the exported manifest reproduce the run's actual
+// weight-load path (PRD-65 Layer 4). The orchestrator auto-detects a cached S3
+// model at deploy time (resolveS3Model) WITHOUT persisting model_s3_uri, so a
+// run that streamed a cached model would otherwise export as an HF load. Mirror
+// that resolution here: if no explicit ModelS3URI but the HF model is cached,
+// set ModelS3URI + UseRunaiStreamer so the exporter emits the streamer flags.
+//
+// SCOPED TO DISAGGREGATED (D/P): the upstream vllm/vllm-openai image D/P uses
+// bundles runai-model-streamer. The co-located PP path (llm-d-aws) does NOT, so
+// PP must NEVER get streamer flags — leave distributed/single-node exports to
+// their persisted ModelS3URI (single-node already persists it; PP can't stream).
+func (s *Server) resolveExportStreamer(ctx context.Context, d *database.RunExportDetails) {
+	if d == nil || d.DeploymentMode == nil || *d.DeploymentMode != "disaggregated" {
+		return
+	}
+	if d.ModelS3URI != nil && *d.ModelS3URI != "" {
+		return // explicit URI already recorded → GetRunExportDetails set UseRunaiStreamer
+	}
+	if d.ModelHfID == "" {
+		return
+	}
+	revision := "main" // export details don't carry revision; matches orchestrator default
+	if cached, _ := s.repo.GetModelCacheByHfID(ctx, d.ModelHfID, revision); cached != nil && cached.Status == "cached" {
+		uri := cached.S3URI
+		d.ModelS3URI = &uri
+		d.UseRunaiStreamer = true
+		if cached.SizeBytes != nil {
+			d.ModelSizeBytes = *cached.SizeBytes // matches the orchestrator's size-derived concurrency
+		}
+	}
+}
+
+// injectMultinodeImageVersions fills the configured llm-d-aws + D/P vLLM image
+// tags onto the export details from tool_versions (PRD-66 Part 2), so the
+// generators compose the same image the orchestrator would deploy. Best-effort:
+// on any lookup failure the fields stay empty and the generators fall back to
+// the shipped defaults (byte-identical to pre-PRD-66 exports).
+func (s *Server) injectMultinodeImageVersions(ctx context.Context, d *database.RunExportDetails) {
+	if d == nil {
+		return
+	}
+	if tv, err := s.repo.GetToolVersions(ctx); err == nil && tv != nil {
+		d.LLMDVersion = tv.LLMDVersion
+		d.PDVLLMVersion = tv.PDVLLMVersion
+	}
 }
 
 // sanitizeFilename converts a model ID to a safe filename.
@@ -75,7 +505,18 @@ type manifestData struct {
 	ModelHfID            string
 	ModelS3URI           string // non-empty when the run loaded weights from S3
 	InstanceType         string
+	Framework            string // "vllm", "vllm-neuron", or "sglang"
 	FrameworkVersion     string
+	// SGLangImageOverride mirrors VLLMImageOverride for SGLang runs (SGLANG_IMAGE).
+	SGLangImageOverride string
+	// RuntimeCommand / RuntimeArgs are the container command + args computed via
+	// the runtime interface (internal/runtime) for the SGLang path, so the export
+	// reproduces the EXACT flags the orchestrator's BuildArgs produced —
+	// including the accelerator-dependent backend + SGLang scheduler knobs —
+	// without re-encoding that logic in the template. Empty for the vLLM/neuron
+	// path (which keeps its existing inline template args).
+	RuntimeCommand []string
+	RuntimeArgs    []string
 	TensorParallelDegree int
 	Quantization         string
 	MaxModelLen          int
@@ -99,17 +540,37 @@ type manifestData struct {
 	// ModelS3URI is set — matching what streamer_mode=off produced at
 	// runtime.
 	UseRunaiStreamer       bool
-	StreamerConcurrency    int   // 0 → template default of 16
-	StreamerMemoryLimitGiB int   // 0 → emit no env var, inherit upstream 40 GB default
+	StreamerConcurrency    int    // bandwidth-aware; profile default 32
+	StreamerChunkBytesize  string // RUNAI_STREAMER_CHUNK_BYTESIZE (bytes); "" ⇒ omit env (8 MiB default)
+	StreamerMemoryLimitGiB int    // 0 → emit no env var, inherit upstream 40 GB default
 	StreamerMemoryLimitBytes int64 // derived for the env-var value
 }
 
 func generateManifest(d *database.RunExportDetails) (string, error) {
+	// PRD-59: distributed / disaggregated runs export the llm-d object graph
+	// (LeaderWorkerSet or prefill/decode Deployments + InferencePool/EPP), NOT a
+	// single-node vLLM Deployment. Reuse the same renderers the orchestrator
+	// uses so a re-apply matches what a fresh distributed run would deploy.
+	if d.DeploymentMode != nil {
+		switch *d.DeploymentMode {
+		case "distributed":
+			return generateDistributedManifest(d)
+		case "disaggregated":
+			return generateDisaggregatedManifest(d)
+		}
+	}
+
+	namePrefix := "vllm-"
+	if d.Framework == "sglang" {
+		namePrefix = "sglang-"
+	}
 	data := manifestData{
-		Name:                 "vllm-" + sanitizeFilename(d.ModelHfID),
+		Name:                 namePrefix + sanitizeFilename(d.ModelHfID),
 		ModelHfID:            d.ModelHfID,
 		InstanceType:         d.InstanceTypeName,
+		Framework:            d.Framework,
 		FrameworkVersion:     d.FrameworkVersion,
+		SGLangImageOverride:  os.Getenv("SGLANG_IMAGE"),
 		TensorParallelDegree: d.TensorParallelDegree,
 		MaxModelLen:          d.MaxModelLen,
 		// PRD-51: PRD-46's --max-num-seqs=concurrency wiring starved
@@ -145,16 +606,37 @@ func generateManifest(d *database.RunExportDetails) (string, error) {
 		data.Quantization = *d.Quantization
 	}
 
-	// PRD-50: streamer knobs. Concurrency defaults to 16 when null.
-	// Memory limit is rendered as bytes in the env var.
-	if d.StreamerConcurrency != nil && *d.StreamerConcurrency > 0 {
-		data.StreamerConcurrency = *d.StreamerConcurrency
-	} else {
-		data.StreamerConcurrency = 16
+	// PRD-50: streamer knobs, resolved through the SAME runtime helpers the
+	// orchestrator uses so the export reproduces what deployed — bandwidth-aware
+	// concurrency (explicit / AWS size-derived on high-BW instances / default 32)
+	// and the matching 4 GiB chunk env on high-BW instances. Memory limit as bytes.
+	data.StreamerConcurrency = runtime.StreamerConcurrency(derefIntExport(d.StreamerConcurrency), d.ModelSizeBytes, d.InstanceTypeName)
+	if data.UseRunaiStreamer {
+		data.StreamerChunkBytesize = runtime.StreamerChunkBytesize(d.InstanceTypeName)
 	}
 	if d.StreamerMemoryLimitGiB != nil && *d.StreamerMemoryLimitGiB > 0 {
 		data.StreamerMemoryLimitGiB = *d.StreamerMemoryLimitGiB
 		data.StreamerMemoryLimitBytes = int64(*d.StreamerMemoryLimitGiB) * 1024 * 1024 * 1024
+	}
+
+	// SGLang single-node export: reproduce the EXACT flags the orchestrator would
+	// pass by reusing the runtime's BuildArgs (rather than re-encoding SGLang's
+	// accelerator-dependent backend + scheduler-knob logic in the template). The
+	// vLLM/neuron path keeps its inline template args unchanged.
+	if d.Framework == "sglang" {
+		if rt, err := runtime.Get("sglang"); err == nil {
+			cmd, args := rt.BuildArgs(runtime.ContainerParams{
+				ModelHfID:            d.ModelHfID,
+				TensorParallelDegree: d.TensorParallelDegree,
+				MaxModelLen:          d.MaxModelLen,
+				Quantization:         derefStrExport(d.Quantization),
+				ChunkedPrefillSize:   derefIntExport(d.ChunkedPrefillSize),
+				MemFractionStatic:    derefFloatExport(d.MemFractionStatic),
+				AcceleratorName:      d.AcceleratorName,
+			})
+			data.RuntimeCommand = cmd
+			data.RuntimeArgs = args
+		}
 	}
 
 	var buf bytes.Buffer
@@ -167,9 +649,13 @@ func generateManifest(d *database.RunExportDetails) (string, error) {
 
 var manifestFuncs = template.FuncMap{
 	"div": func(a, b int) int { return a / b },
+	// quote renders a container-arg string as a double-quoted YAML scalar,
+	// matching the inline vLLM args style (e.g. "--tp-size"). Used for the
+	// SGLang RuntimeCommand/RuntimeArgs path.
+	"quote": func(s string) string { return "\"" + strings.ReplaceAll(s, "\"", "\\\"") + "\"" },
 }
 
-var manifestTemplate = template.Must(template.New("manifest").Funcs(manifestFuncs).Parse(`# Kubernetes manifest for vLLM model deployment
+var manifestTemplate = template.Must(template.New("manifest").Funcs(manifestFuncs).Parse(`# Kubernetes manifest for {{ if eq .Framework "sglang" }}SGLang{{ else }}vLLM{{ end }} model deployment
 # Generated from AccelBench benchmark run
 #
 # Model: {{ .ModelHfID }}
@@ -191,6 +677,9 @@ var manifestTemplate = template.Must(template.New("manifest").Funcs(manifestFunc
 {{- end }}
 {{- if .Quantization }}
 # Quantization: {{ .Quantization }}
+{{- end }}
+{{- if eq .Framework "sglang" }}
+# Framework: SGLang {{ .FrameworkVersion }}
 {{- end }}
 #
 # Prerequisites:
@@ -255,8 +744,14 @@ spec:
       nodeSelector:
         node.kubernetes.io/instance-type: {{ .InstanceType }}
       containers:
-        - name: vllm
-{{- if eq .AcceleratorType "gpu" }}
+        - name: {{ if eq .Framework "sglang" }}sglang{{ else }}vllm{{ end }}
+{{- if eq .Framework "sglang" }}
+{{- if .SGLangImageOverride }}
+          image: {{ .SGLangImageOverride }}
+{{- else }}
+          image: {{ if .PullThroughRegistry }}{{ .PullThroughRegistry }}/dockerhub/{{ end }}lmsysorg/sglang:{{ .FrameworkVersion }}
+{{- end }}
+{{- else if eq .AcceleratorType "gpu" }}
 {{- if .VLLMImageOverride }}
           image: {{ .VLLMImageOverride }}
 {{- else }}
@@ -287,12 +782,33 @@ spec:
             - name: NCCL_P2P_LEVEL
               value: "NVL"
 {{- end }}
-{{- if and .UseRunaiStreamer (gt .StreamerMemoryLimitBytes 0) }}
+{{- if .UseRunaiStreamer }}
+            # Run:ai streamer S3 retry tuning (real in the streamer C++ source).
+            - name: RUNAI_STREAMER_S3_REQUEST_TIMEOUT_MS
+              value: "3000"
+            - name: RUNAI_STREAMER_S3_LOW_SPEED_LIMIT
+              value: "1048576"
+{{- if .StreamerChunkBytesize }}
+            # High-bandwidth instance: AWS's 4 GiB chunk (else 8 MiB default).
+            - name: RUNAI_STREAMER_CHUNK_BYTESIZE
+              value: "{{ .StreamerChunkBytesize }}"
+{{- end }}
+{{- if gt .StreamerMemoryLimitBytes 0 }}
             # PRD-50: cap the Run:ai streamer's shared CPU buffer.
             - name: RUNAI_STREAMER_MEMORY_LIMIT
               value: "{{ .StreamerMemoryLimitBytes }}"
 {{- end }}
-{{- if eq .AcceleratorType "gpu" }}
+{{- end }}
+{{- if eq .Framework "sglang" }}
+          command:
+{{- range .RuntimeCommand }}
+            - {{ . | quote }}
+{{- end }}
+          args:
+{{- range .RuntimeArgs }}
+            - {{ . | quote }}
+{{- end }}
+{{- else if eq .AcceleratorType "gpu" }}
           args:
 {{- if .UseRunaiStreamer }}
             - "--model"
@@ -300,7 +816,7 @@ spec:
             - "--load-format"
             - "runai_streamer"
             - "--model-loader-extra-config"
-            - '{"concurrency":{{ .StreamerConcurrency }}}'
+            - '{"concurrency":{{ .StreamerConcurrency }}{{ if gt .TensorParallelDegree 1 }},"distributed":true{{ end }}}'
 {{- else if .ModelS3URI }}
             # Streamer disabled (streamer_mode=off on the original run).
             - "--model"
@@ -454,6 +970,13 @@ func (s *Server) handleExportRunCSV(w http.ResponseWriter, r *http.Request) {
 
 	metrics, _ := s.repo.GetMetricsByRunID(r.Context(), runID)     // nil-safe inside generator
 	details, _ := s.repo.GetRunExportDetails(r.Context(), runID)    // nil-safe inside generator
+	// PRD-59: attach the per-node/per-role breakdown so a distributed run's CSV
+	// carries the shard rows. Empty for single-node runs → CSV byte-unchanged.
+	if metrics != nil {
+		if shards, serr := s.repo.GetShardMetrics(r.Context(), runID); serr == nil {
+			metrics.Shards = shards
+		}
+	}
 
 	// Best-effort pricing lookup.
 	var hourlyRate *float64
@@ -631,6 +1154,7 @@ func (s *Server) handleExportSuiteManifest(w http.ResponseWriter, r *http.Reques
 	if suite.FrameworkVersion != nil {
 		details.FrameworkVersion = *suite.FrameworkVersion
 	}
+	s.injectMultinodeImageVersions(r.Context(), details)
 
 	manifest, err := generateManifest(details)
 	if err != nil {

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useParams, Navigate } from "react-router-dom";
 import {
   getRun,
   getRunDetail,
@@ -94,6 +94,13 @@ export default function ResultDetail() {
     );
   }
   if (!run) return <div className="p-6 caption">LOADING…</div>;
+
+  // PRD-59: distributed / disaggregated runs use the purpose-built distributed
+  // report (combined loadgen + per-node/per-role DCGM), not this single-node
+  // report. Redirect so /results/:id lands on the right view for these runs.
+  if (run.deployment_mode === "distributed" || run.deployment_mode === "disaggregated") {
+    return <Navigate to={`/results/${run.id}/distributed`} replace />;
+  }
 
   const isNeuron = (instanceType?.accelerator_type ?? "").toLowerCase() === "neuron";
   const acceleratorNoun = isNeuron ? "chip" : "GPU";
@@ -204,7 +211,23 @@ export default function ResultDetail() {
 
         <ConfigPanel
           headline={[
-            { label: "TP Degree", value: run.tensor_parallel_degree },
+            // PRD-57/58: distributed + disaggregated runs show the topology up
+            // front; single runs are unchanged (deployment_mode null → omitted).
+            ...(run.deployment_mode === "disaggregated"
+              ? [{
+                  label: "Topology",
+                  value: `${[
+                    run.prefill_replicas ? `${run.prefill_replicas}P` : "",
+                    run.decode_replicas ? `${run.decode_replicas}D` : "",
+                    run.both_replicas ? `${run.both_replicas}B` : "",
+                  ].filter(Boolean).join("") || "?"} · ${run.node_count ?? "?"} nodes`,
+                }]
+              : run.deployment_mode === "distributed"
+              ? [{
+                  label: "Topology",
+                  value: `${run.node_count ?? "?"} nodes · TP=${run.tensor_parallel_degree} · PP=${run.pipeline_parallel_degree ?? "?"}`,
+                }]
+              : [{ label: "TP Degree", value: run.tensor_parallel_degree }]),
             { label: "Quantization", value: run.quantization ?? "default" },
             { label: "Max Model Len", value: run.max_model_len ?? null },
             {
@@ -213,6 +236,36 @@ export default function ResultDetail() {
             },
           ]}
           details={[
+            ...(run.deployment_mode === "disaggregated"
+              ? [
+                  { label: "Deployment", value: "disaggregated (prefill/decode, llm-d)" },
+                  ...(run.prefill_replicas
+                    ? [{ label: "Prefill", value: `${run.prefill_replicas} × TP=${run.prefill_tp ?? "?"}` }]
+                    : []),
+                  ...(run.decode_replicas
+                    ? [{ label: "Decode", value: `${run.decode_replicas} × TP=${run.decode_tp ?? "?"}` }]
+                    : []),
+                  ...(run.both_replicas
+                    ? [{ label: "Both (co-located)", value: `${run.both_replicas} × TP=${run.both_tp ?? "?"}` }]
+                    : []),
+                  { label: "Node Count", value: run.node_count ?? null },
+                  { label: "KV Connector", value: run.kv_connector ?? null },
+                  { label: "KV Transfer", value: run.kv_transfer_backend ?? null },
+                  { label: "Network Fabric", value: run.network_mode ?? null },
+                  // PRD-61: effective EPP routing config (NULL → shipped default).
+                  {
+                    label: "Routing / EPP",
+                    value: `nonCachedTokens=${run.pd_noncached_tokens ?? "16 (default)"} · weight=${run.pd_prefix_cache_weight ?? 2}/${run.pd_queue_scorer_weight ?? 1} · prefixBlocks=${run.pd_max_prefix_blocks ?? 256} · lru=${run.pd_lru_capacity_per_server ?? 31250}`,
+                  },
+                ]
+              : run.deployment_mode === "distributed"
+              ? [
+                  { label: "Deployment", value: "distributed (multi-node llm-d)" },
+                  { label: "Node Count", value: run.node_count ?? null },
+                  { label: "Pipeline Parallel", value: run.pipeline_parallel_degree ?? null },
+                  { label: "Network Fabric", value: run.network_mode ?? null },
+                ]
+              : []),
             { label: "Concurrency", value: run.concurrency },
             { label: "Dataset", value: run.dataset_name },
             { label: "Scenario", value: run.scenario_id ?? null },
